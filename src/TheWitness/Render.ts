@@ -1,5 +1,5 @@
 
-import { mat4, ReadonlyMat4, vec3 } from "gl-matrix";
+import { mat4, quat, ReadonlyMat4, vec3 } from "gl-matrix";
 import { CameraController } from "../Camera.js";
 import { Color, colorCopy, colorNewCopy, colorNewFromRGBA, Red, White } from "../Color.js";
 import { AABB } from "../Geometry.js";
@@ -14,7 +14,7 @@ import { GfxRenderHelper } from "../gfx/render/GfxRenderHelper.js";
 import { GfxRendererLayer, GfxRenderInst, GfxRenderInstList, GfxRenderInstManager, makeSortKey, setSortKeyDepth } from "../gfx/render/GfxRenderInstManager.js";
 import { preprocessShader_GLSL } from "../gfx/shaderc/GfxShaderCompiler.js";
 import { hashCodeNumberUpdate, HashMap } from "../HashMap.js";
-import { setMatrixTranslation } from "../MathHelpers.js";
+import { setMatrixTranslation, Vec3NegY, Vec3UnitY, Vec3UnitZ } from "../MathHelpers.js";
 import { DeviceProgram } from "../Program.js";
 import { UberShaderInstance, UberShaderTemplate } from "../SourceEngine/UberShader.js";
 import { TextureMapping } from "../TextureHolder.js";
@@ -666,7 +666,10 @@ export class Render_Material_Cache {
 
 const scratchColor = colorNewCopy(White);
 const scratchAABB = new AABB();
+const ASSET_LOADS_PER_FRAME = 16;
+
 const scratchVec3a = vec3.create();
+const scratchVec3b = vec3.create();
 class Device_Material {
     public visible: boolean = true;
 
@@ -679,6 +682,9 @@ class Device_Material {
     public megaStateFlags: Partial<GfxMegaStateDescriptor> = {};
 
     constructor(globals: TheWitnessGlobals, public render_material: Render_Material) {
+        const __g = globalThis as any;
+        const __t = Date.now();
+
         const wrap_sampler = globals.renderCache.createSampler({
             minFilter: GfxTexFilterMode.Bilinear,
             magFilter: GfxTexFilterMode.Bilinear,
@@ -933,6 +939,31 @@ export class TheWitnessRenderer implements SceneGfx {
         c.setSceneMoveSpeedMult(1/100);
     }
 
+    public getDefaultWorldMatrix(dst: mat4): void {
+        // Start the camera where the game starts the player. Records we resynced past can be
+        // mistaken for the player -- several claim its portable_id of 0 -- but they carry a
+        // zeroed orientation, which a real one never does.
+        const player = this.globals.entity_manager.flat_entity_list.find((e) => {
+            return e.type_name === 'Entity_Type_Human' && Math.abs(quat.length(e.orientation) - 1.0) < 0.01;
+        });
+        if (player === undefined) {
+            mat4.identity(dst);
+            return;
+        }
+
+        // The world is Z-up, so lift the camera from the player's feet to about eye height and
+        // look along the direction they're facing, levelled off.
+        vec3.set(scratchVec3a, player.position[0], player.position[1], player.position[2] + 1.7);
+        vec3.transformQuat(scratchVec3b, Vec3NegY, player.orientation);
+        scratchVec3b[2] = 0.0;
+        if (vec3.squaredLength(scratchVec3b) < 0.0001)
+            vec3.copy(scratchVec3b, Vec3UnitY);
+        vec3.normalize(scratchVec3b, scratchVec3b);
+        vec3.add(scratchVec3b, scratchVec3a, scratchVec3b);
+
+        mat4.targetTo(dst, scratchVec3a, scratchVec3b, Vec3UnitZ);
+    }
+
     private prepareToRender(device: GfxDevice, viewerInput: ViewerRenderInput): void {
         const template = this.renderHelper.pushTemplateRenderInst();
         template.setBindingLayouts(bindingLayouts);
@@ -964,6 +995,8 @@ export class TheWitnessRenderer implements SceneGfx {
 
         globals.occlusion_manager.prepareToRender(globals, this.renderHelper.renderInstManager);
 
+        globals.asset_loads_remaining = ASSET_LOADS_PER_FRAME;
+
         // Go through each entity cluster.
         for (let i = 0; i < globals.entity_render_list.clusters.length; i++) {
             const cluster = globals.entity_render_list.clusters[i];
@@ -973,8 +1006,15 @@ export class TheWitnessRenderer implements SceneGfx {
             if (!viewpoint.frustum.containsSphere(cluster.bounding_center_world, cluster.bounding_radius_world))
                 continue;
 
+            // Brings in the cluster's package, which its elements load their assets out of.
+            cluster.ensure_assets_loaded(globals);
+            if (!cluster.assets_are_loaded())
+                continue;
+
             for (let j = 0; j < cluster.elements.length; j++) {
                 const entity = globals.entity_manager.entity_list[cluster.elements[j]];
+                if (entity === undefined)
+                    continue;
                 entity.prepareToRender(globals, this.renderHelper.renderInstManager);
             }
         }

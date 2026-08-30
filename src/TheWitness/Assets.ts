@@ -61,6 +61,7 @@ enum D3DFormat {
     A8R8G8B8 = 0x15,
     X8R8G8B8 = 0x16,
     L16      = 0x51,
+    A8       = 0x1C,
 }
 
 function get_gfx_format(format: D3DFormat, srgb: boolean): GfxFormat {
@@ -78,8 +79,10 @@ function get_gfx_format(format: D3DFormat, srgb: boolean): GfxFormat {
         return srgb ? GfxFormat.U8_RGBA_SRGB : GfxFormat.U8_RGBA_NORM;
     else if (format === D3DFormat.L16)
         return GfxFormat.U16_R_NORM;
+    else if (format === D3DFormat.A8)
+        return GfxFormat.U8_R_NORM;
     else
-        throw new Error("whoops");
+        throw new Error(`unsupported D3D texture format 0x${(format as number).toString(16)}`);
 }
 
 function is_block_compressed(format: D3DFormat): boolean {
@@ -117,6 +120,8 @@ function get_mipmap_size(format: D3DFormat, width: number, height: number, depth
             return num_pixels * 4;
         else if (format === D3DFormat.L16)
             return num_pixels * 2;
+        else if (format === D3DFormat.A8)
+            return num_pixels;
         else
             throw new Error("whoops");
     }
@@ -170,7 +175,8 @@ export class Texture_Asset {
     private texture: GfxTexture;
 
     constructor(device: GfxDevice, version: number, stream: Stream, name: string) {
-        assert(version === 0x12);
+        // 0x16 lays the levels out the same way, and parks a 64x64 alpha mask after them.
+        assert(version === 0x12 || version === 0x16);
 
         // Texture_Asset
         this.width = stream.readUint16();
@@ -239,12 +245,16 @@ export class Lightmap_Asset {
     private texture: GfxTexture;
 
     constructor(device: GfxDevice, version: number, stream: Stream, name: string) {
+        // Version 0x13 dropped `vertex_count` here, along with the two OpenGL ES format fields
+        // that used to follow the D3D one; its pixel data starts right after `d3d_format`.
+        const has_legacy_fields = version < 0x13;
+
         const checksum = stream.readUint32();
         this.width = stream.readUint16();
         this.height = stream.readUint16();
 
-        // This might be missing on newer versions?
-        const vertex_count = stream.readUint32();
+        if (has_legacy_fields)
+            stream.readUint32(); // vertex_count
 
         const generator_version = stream.readUint32();
         const bounce_count = stream.readUint32();
@@ -255,8 +265,11 @@ export class Lightmap_Asset {
         const pixel_data_size = stream.readUint32();
         this.color_range = stream.readFloat32();
         const d3d_format = stream.readUint32();
-        const ogles_internal_format = stream.readUint32();
-        const ogles_type = stream.readUint32();
+
+        if (has_legacy_fields) {
+            stream.readUint32(); // ogles_internal_format
+            stream.readUint32(); // ogles_type
+        }
 
         this.texture = device.createTexture(makeTextureDescriptor2D(get_gfx_format(d3d_format, false), this.width, this.height, 1));
         device.setResourceName(this.texture, name);
@@ -432,13 +445,15 @@ function Stream_read_Array_uchar(stream: Stream): ArrayBufferSlice {
     return stream.readBytes(count);
 }
 
-function unpack_Sub_Mesh_Asset(stream: Stream): Sub_Mesh_Asset {
+function unpack_Sub_Mesh_Asset(stream: Stream, version: number): Sub_Mesh_Asset {
     const material_index = stream.readUint32();
     const vertex_attribute_flags = stream.readUint32();
     const vertex_size = stream.readUint32();
     const vertex_count = stream.readUint32();
     const index_count = stream.readUint32();
-    const max_instance_count = stream.readUint32();
+    // Version 0x31 dropped max_instance_count; only the detail level is left here. Reading both
+    // takes the index array's length as the detail level and the first indices as that length.
+    const max_instance_count = version >= 0x31 ? 1 : stream.readUint32();
     const detail_level = stream.readUint32();
     const index_data = Stream_read_Array_uchar(stream);
     const vertex_data = Stream_read_Array_uchar(stream);
@@ -664,10 +679,19 @@ export class Mesh_Asset {
         this.box = Stream_read_Bounding_Box(stream);
         this.sphere = Stream_read_Bounding_Sphere(stream);
         this.lightmap_size = Stream_read_Vector2(stream);
+
+        // Version 0x31 added two vectors here, ahead of the material array. Reading the array
+        // without them takes the first of those floats as its length, which asks for a billion
+        // materials and takes the renderer process with it.
+        if (version >= 0x31) {
+            Stream_read_Vector3(stream);
+            Stream_read_Vector3(stream);
+        }
+
         const material_array = unpack_Array(stream, unpack_Render_Material);
 
-        const sub_mesh_array = unpack_Array(stream, unpack_Sub_Mesh_Asset);
-        const z_sub_mesh_array = unpack_Array(stream, unpack_Sub_Mesh_Asset);
+        const sub_mesh_array = unpack_Array(stream, (s) => unpack_Sub_Mesh_Asset(s, version));
+        const z_sub_mesh_array = unpack_Array(stream, (s) => unpack_Sub_Mesh_Asset(s, version));
 
         this.material_array = material_array;
         this.device_mesh_array = sub_mesh_array.map((asset) => new Device_Mesh(cache, this, asset));
@@ -770,6 +794,7 @@ export class Asset_Manager {
     }
 
     public load_bundle(bundle_filename: string): void {
+
         const bundle_zip_entry = assertExists(this.entry_cache.get(bundle_filename));
         const bundle_zip_data = decompressZipFileEntry(bundle_zip_entry);
         const bundle_zip = parseZipFile(bundle_zip_data);
@@ -800,8 +825,19 @@ export class Asset_Manager {
         const asset_data = this.load_asset_data(processed_filename);
         if (asset_data === null)
             return null;
-        const asset = load_asset(this.device, this.renderCache, type, asset_data, source_name);
-        if ('destroy' in asset)
+
+        let asset: AssetT<T>;
+        try {
+            asset = load_asset(this.device, this.renderCache, type, asset_data, source_name);
+        } catch (e) {
+            // An asset we can't decode shouldn't take the whole world down with it; callers
+            // already handle a missing asset, since not every asset is in every bundle.
+            console.warn(`TheWitness: could not load ${processed_filename}:`, e);
+            this.asset_cache.set(processed_filename, null);
+            return null;
+        }
+
+        if (asset !== null && 'destroy' in asset)
             this.destroyables.push(asset as Destroyable);
         this.asset_cache.set(processed_filename, asset);
         return asset;

@@ -4,11 +4,15 @@ import { colorNewFromRGBA, Color } from "../Color.js";
 import { vec2, vec3, quat, vec4 } from "gl-matrix";
 
 export class Stream {
-    private offset: number = 0;
+    public offset: number = 0;
     private view: DataView;
 
     constructor(private buffer: ArrayBufferSlice) {
         this.view = buffer.createDataView();
+    }
+
+    public get byteLength(): number {
+        return this.buffer.byteLength;
     }
 
     public readUint8(): number {

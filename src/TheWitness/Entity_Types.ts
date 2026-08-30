@@ -2,7 +2,7 @@
 import { vec3 } from "gl-matrix";
 import { Stream, Stream_read_Vector3, Stream_read_Array_int, Stream_read_Color, Stream_read_Quaternion, Stream_read_Vector2, Stream_read_Array_float } from "./Stream.js";
 import ArrayBufferSlice from "../ArrayBufferSlice.js";
-import { assert, nullify } from "../util.js";
+import { assert, nullify, setAssertLogStacks } from "../util.js";
 import { Entity, Portable, Lightmap_Table, Entity_Pattern_Point, Entity_Inanimate, Entity_Power_Cable, Entity_Cluster, Entity_Group } from "./Entity.js";
 
 function get_truth_value(portable: Portable, item: Metadata_Item): boolean {
@@ -1365,6 +1365,22 @@ class Entity_Type_Machine_Panel extends Portable_Type {
     }
 }
 
+// The player. The rest of its data is unimplemented -- unpacking stops after the fields every
+// entity has, and load_entities resyncs past the remainder -- but those fields include the
+// position the game starts you at, which is where the camera wants to start too.
+class Entity_Type_Human extends Portable_Type {
+    public static Type_Name = 'Human';
+
+    constructor() {
+        super();
+        make_entity_metadata(this.metadata);
+    }
+
+    public override construct_new_obj(portable_id: number, revision_number: number): Entity {
+        return new Entity_Inanimate(portable_id, revision_number);
+    }
+}
+
 class Entity_Type_Marker extends Portable_Type {
     public static Type_Name = 'Marker';
 
@@ -2037,6 +2053,7 @@ class Portable_Type_Manager {
         this.register_type(Entity_Type_Light);
         this.register_type(Entity_Type_Light_Probe);
         this.register_type(Entity_Type_Machine_Panel);
+        this.register_type(Entity_Type_Human);
         this.register_type(Entity_Type_Marker);
         this.register_type(Entity_Type_Multipanel);
         this.register_type(Entity_Type_Note);
@@ -2083,6 +2100,109 @@ function load_type_manifest(stream: Stream): Portable_Type_Load_Info[] {
     return info;
 }
 
+// Entity records are written back to back with no length prefix, so a record we cannot unpack
+// -- an unimplemented type, or a type whose revision in the data is newer than the metadata
+// above -- desyncs every record after it. Rather than lose the world, probe forward for the
+// offset where records unpack cleanly again, and carry on from there.
+//
+// The two cases want different handling. A type carrying a newer revision unpacks fine but stops
+// a few bytes short, the same few bytes every time; we keep those entities, because everything
+// ahead of the field we don't know about -- the transform and the mesh the renderer wants -- read
+// correctly, and only the tail of the record is shifted. A type we don't implement at all can
+// only be dropped.
+const RESYNC_SCAN_LIMIT = 0x8000;
+const RESYNC_TOTAL_BUDGET = 0x100000;
+const RESYNC_CONFIRM_DEPTH = 4;
+// Probes run against a window just big enough for the records they read, so that a garbage
+// array count read out of misaligned data runs off the end of the buffer immediately rather
+// than allocating its way through the rest of the world.
+const RESYNC_PROBE_WINDOW = 0x400;
+const RESYNC_DELTA_WINDOW = 0x100;
+
+function unpack_entity(stream: Stream, type_manifest: Portable_Type_Load_Info[]): Entity | null {
+    const portable_id = stream.readUint32();
+    const type_id = stream.readValue(0xFF);
+
+    const portable_type_info = type_manifest[type_id];
+    if (portable_type_info === undefined)
+        return null;
+
+    const portable_type = portable_type_info.portable_type;
+    if (portable_type === null || portable_type === undefined)
+        return null;
+
+    const revision_number = portable_type_info.revision_number;
+    const portable = unpack_single_portable(stream, portable_type, portable_id, revision_number) as Entity;
+    portable_type.unserialize_proc(stream, portable, revision_number);
+    return portable;
+}
+
+// Could a record start at `offs`? A byte test, to keep whole unpacks off the scanning path.
+function is_record_head(buffer: ArrayBufferSlice, view: DataView, type_manifest: Portable_Type_Load_Info[], offs: number): boolean {
+    if (offs < 0 || offs + 0x05 > buffer.byteLength)
+        return false;
+    const portable_type_info = type_manifest[view.getUint8(offs + 0x04)];
+    return portable_type_info !== undefined && portable_type_info.portable_type !== null && portable_type_info.portable_type !== undefined;
+}
+
+// Do `depth` records unpack cleanly starting at `offs`?
+function records_unpack_at(buffer: ArrayBufferSlice, type_manifest: Portable_Type_Load_Info[], offs: number, depth: number): boolean {
+    if (offs < 0 || offs >= buffer.byteLength)
+        return false;
+
+    try {
+        const end = Math.min(offs + depth * RESYNC_PROBE_WINDOW, buffer.byteLength);
+        const stream = new Stream(buffer.slice(offs, end));
+
+        for (let i = 0; i < depth; i++) {
+            if (offs + stream.offset === buffer.byteLength)
+                return true;
+            if (unpack_entity(stream, type_manifest) === null)
+                return false;
+        }
+    } catch (e) {
+        return false;
+    }
+
+    return true;
+}
+
+// Byte offset of the record following the one at `record_offset`, or -1 if we can't find it.
+// `parse_end` is where unpacking stopped (-1 if it couldn't run at all): when a record only
+// went wrong because its revision carries fields we don't know about, the real end is a few
+// bytes past it, and the difference is the same for every record of that type.
+function find_next_record(buffer: ArrayBufferSlice, view: DataView, type_manifest: Portable_Type_Load_Info[], record_offset: number, parse_end: number, delta_hint: number | undefined, length_hint: number | undefined): number {
+    const confirm = (offs: number): boolean =>
+        offs > record_offset && is_record_head(buffer, view, type_manifest, offs) && records_unpack_at(buffer, type_manifest, offs, RESYNC_CONFIRM_DEPTH);
+
+    if (parse_end > 0) {
+        if (delta_hint !== undefined && confirm(parse_end + delta_hint))
+            return parse_end + delta_hint;
+
+        for (let delta = 0; delta <= RESYNC_DELTA_WINDOW; delta++)
+            if (confirm(parse_end + delta))
+                return parse_end + delta;
+
+        for (let delta = -1; delta >= -RESYNC_DELTA_WINDOW; delta--)
+            if (confirm(parse_end + delta))
+                return parse_end + delta;
+    }
+
+    if (length_hint !== undefined && confirm(record_offset + length_hint))
+        return record_offset + length_hint;
+
+    const limit = Math.min(record_offset + RESYNC_SCAN_LIMIT, buffer.byteLength);
+    for (let offs = record_offset + 0x05; offs <= limit; offs++) {
+        // One record is a cheap filter; only pay for the full confirmation on offsets that pass.
+        if (!is_record_head(buffer, view, type_manifest, offs) || !records_unpack_at(buffer, type_manifest, offs, 1))
+            continue;
+        if (confirm(offs))
+            return offs;
+    }
+
+    return -1;
+}
+
 export function load_entities(version: number, buffer: ArrayBufferSlice): Entity[] {
     assert(version === 0x01);
     const stream = new Stream(buffer);
@@ -2093,17 +2213,84 @@ export function load_entities(version: number, buffer: ArrayBufferSlice): Entity
     const count = stream.readValue(20000);
 
     const entities: Entity[] = [];
-    for (let i = 0; i < count; i++) {
-        const portable_id = stream.readUint32();
-        const type_id = stream.readValue(0xFF);
+    const recovered = new Map<string, number>();
+    const dropped = new Map<string, number>();
+    const record_length = new Map<string, number>();
+    const record_delta = new Map<string, number>();
+    const view = buffer.createDataView();
+    let scanned = 0;
 
-        const portable_type_info = type_manifest[type_id];
-        const portable_type = portable_type_info.portable_type;
-        const revision_number = portable_type_info.revision_number;
-        const portable = unpack_single_portable(stream, portable_type, portable_id, revision_number) as Entity;
-        portable_type.unserialize_proc(stream, portable, revision_number);
-        entities.push(portable);
+    const log_stacks = setAssertLogStacks(false);
+    for (let i = 0; i < count; i++) {
+        const record_offset = stream.offset;
+        if (record_offset + 0x05 > buffer.byteLength) {
+            console.warn(`TheWitness: entity stream ended early, at ${i} of ${count}`);
+            break;
+        }
+
+        const type_id = view.getUint8(record_offset + 0x04);
+        const type_name = type_manifest[type_id] !== undefined ? type_manifest[type_id].name : `type ${type_id}`;
+
+        let entity: Entity | null = null;
+        let parse_end = -1;
+        let in_sync = false;
+        try {
+            entity = unpack_entity(stream, type_manifest);
+            if (entity !== null) {
+                // Only an unpack that ran to completion says anything about where the record
+                // ends; one that threw partway leaves the stream wherever it gave up.
+                parse_end = stream.offset;
+                // Unpacking against a stale revision can consume a plausible but wrong number
+                // of bytes, so only trust a record that leaves us on another one.
+                in_sync = parse_end === buffer.byteLength || records_unpack_at(buffer, type_manifest, parse_end, 1);
+            }
+        } catch (e) {
+            entity = null;
+        }
+
+        if (entity !== null && in_sync) {
+            record_length.set(type_name, parse_end - record_offset);
+            entities.push(entity);
+            continue;
+        }
+
+        if (scanned > RESYNC_TOTAL_BUDGET) {
+            console.warn(`TheWitness: too much of the entity stream is unreadable; stopping at ${i} of ${count}`);
+            break;
+        }
+
+        let next_offset = -1;
+        try {
+            next_offset = find_next_record(buffer, view, type_manifest, record_offset, parse_end, record_delta.get(type_name), record_length.get(type_name));
+        } catch (e) {
+            next_offset = -1;
+        }
+
+        if (next_offset < 0) {
+            console.warn(`TheWitness: lost the entity stream at ${i} of ${count} (${type_name})`);
+            break;
+        }
+
+        scanned += next_offset - record_offset;
+        record_length.set(type_name, next_offset - record_offset);
+        stream.offset = next_offset;
+
+        if (entity !== null) {
+            record_delta.set(type_name, next_offset - parse_end);
+            recovered.set(type_name, (recovered.get(type_name) ?? 0) + 1);
+            entities.push(entity);
+        } else {
+            dropped.set(type_name, (dropped.get(type_name) ?? 0) + 1);
+        }
     }
+    setAssertLogStacks(log_stacks);
+
+    const total = (m: Map<string, number>) => [...m.values()].reduce((a, b) => a + b, 0);
+    const summarize = (m: Map<string, number>) => [...m].sort((a, b) => b[1] - a[1]).map(([name, n]) => `${name} x${n}`).join(', ');
+    if (recovered.size > 0)
+        console.warn(`TheWitness: kept ${total(recovered)} of ${count} entities whose revision is newer than we know, so their trailing fields are off: ${summarize(recovered)}`);
+    if (dropped.size > 0)
+        console.warn(`TheWitness: dropped ${total(dropped)} of ${count} entities we can't unpack: ${summarize(dropped)}`);
 
     return entities;
 }

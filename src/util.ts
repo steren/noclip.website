@@ -1,9 +1,21 @@
 
 import ArrayBufferSlice from './ArrayBufferSlice.js';
 
+let assertLogStacks = true;
+
+// Speculative parsers (see TheWitness/Entity_Types.ts) trip asserts by the thousand while
+// probing a stream for a record boundary; capturing a stack for each one costs far more than
+// the parse itself. Returns the previous setting, so callers can restore it when they're done.
+export function setAssertLogStacks(v: boolean): boolean {
+    const old = assertLogStacks;
+    assertLogStacks = v;
+    return old;
+}
+
 export function assert(b: boolean, message: string = ""): asserts b {
     if (!b) {
-        console.error(new Error().stack);
+        if (assertLogStacks)
+            console.error(new Error().stack);
         throw new Error(`Assert fail: ${message}`);
     }
 }

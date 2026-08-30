@@ -121,6 +121,8 @@ export class TheWitnessGlobals {
     public device_material_cache: Device_Material_Cache;
     public render_settings = new Render_Settings();
     public scene_time = 0.0;
+    // How many more entities may create their assets this frame; see Entity.ensure_assets_loaded.
+    public asset_loads_remaining = 0;
 
     constructor(public device: GfxDevice, public asset_manager: Asset_Manager) {
         this.renderCache = new GfxRenderCache(this.device);
