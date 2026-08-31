@@ -414,20 +414,29 @@ vec3 CalcNormalMap() {
     return t_NormalMapSample;
 }
 
+// The sky along a direction, without the sun's disc. The skydome draws with this, and the water
+// reflects it, so the two always agree about what the sky looks like.
+vec3 CalcSkyColor(in vec3 t_Direction) {
+    vec3 t_Color = u_FogSkyColor.rgb;
+
+    float t_FogColorAmount = pow(saturate(1.0 - t_Direction.z), u_FogColor.a);
+    t_Color.rgb = mix(t_Color.rgb, u_FogColor.rgb, t_FogColorAmount);
+
+    float t_SunAmount = saturate(dot(t_Direction.xyz, u_KeyLightDir.xyz));
+    float t_FogSunColorAmount = pow(t_SunAmount, 8.0);
+    t_Color.rgb = mix(t_Color.rgb, u_FogSunColor.rgb, t_FogSunColorAmount);
+
+    return t_Color;
+}
+
 vec4 CalcAlbedo() {
     bool use_sky = ${this.is_type(m, Material_Type.Sky)};
     if (use_sky) {
         vec3 t_Normal = normalize(v_PositionWorld.xyz);
 
-        vec3 t_Color = u_FogSkyColor.rgb;
-
-        float t_FogColorAmount = pow(saturate(1.0 - t_Normal.z), u_FogColor.a);
-        t_Color.rgb = mix(t_Color.rgb, u_FogColor.rgb, t_FogColorAmount);
+        vec3 t_Color = CalcSkyColor(t_Normal);
 
         float t_SunAmount = saturate(dot(t_Normal.xyz, u_KeyLightDir.xyz));
-        float t_FogSunColorAmount = pow(t_SunAmount, 8.0);
-        t_Color.rgb = mix(t_Color.rgb, u_FogSunColor.rgb, t_FogSunColorAmount);
-
         vec3 t_SunColor = vec3(1.0, 0.8, 0.4) * 256.0;
         t_Color.rgb += t_SunColor * smoothstep(0.9985, 0.9989, t_SunAmount);
 
@@ -536,6 +545,36 @@ void mainPS() {
 
     vec3 t_FinalColor = vec3(0.0);
     t_FinalColor.rgb += t_DiffuseLight.rgb * t_Albedo.rgb;
+
+    bool use_lake = ${this.is_type(m, Material_Type.Lake)};
+    if (use_lake) {
+        // Ripples: two slow wave trains crossing each other, tilting the surface a little. The
+        // amplitude is small on purpose -- the island's water is nearly a mirror.
+        vec2 t_WavePos = v_PositionWorld.xy;
+        float t_Wave0 = sin(dot(t_WavePos, vec2(0.21, 0.13)) + u_SceneTime * 0.8);
+        float t_Wave1 = sin(dot(t_WavePos, vec2(-0.09, 0.25)) + u_SceneTime * 0.55);
+        vec3 t_WaterNormal = normalize(vec3(0.02 * (t_Wave0 + 0.5 * t_Wave1), 0.02 * (t_Wave1 - 0.5 * t_Wave0), 1.0));
+
+        // Grazing angles mirror the sky, straight down looks into the water: the Fresnel term
+        // between the two is what gives the horizon its pale band and the foreground its blue.
+        vec3 t_Reflected = reflect(-t_WorldDirectionToEye, t_WaterNormal);
+        t_Reflected.z = abs(t_Reflected.z);
+        vec3 t_SkyReflection = CalcSkyColor(t_Reflected);
+
+        float t_ViewDot = saturate(dot(t_WaterNormal, t_WorldDirectionToEye));
+        float t_Fresnel = 0.02 + 0.98 * pow(1.0 - t_ViewDot, 5.0);
+
+        // Looking into the water, from a shallow blue-green to the deep blue further out.
+        vec3 t_ShallowColor = vec3(0.014, 0.153, 0.216);
+        vec3 t_DeepColor = vec3(0.004, 0.032, 0.083);
+        vec3 t_WaterColor = mix(t_DeepColor, t_ShallowColor, t_ViewDot);
+
+        t_FinalColor = mix(t_WaterColor, t_SkyReflection, t_Fresnel);
+
+        // The sun's glint, tight enough to read as a highlight rather than a second sun.
+        float t_SunDot = saturate(dot(t_Reflected, u_KeyLightDir.xyz));
+        t_FinalColor += u_FogSunColor.rgb * pow(t_SunDot, 350.0) * 6.0;
+    }
 
     // TODO(jstpierre): Fog
 
@@ -666,7 +705,7 @@ export class Render_Material_Cache {
 
 const scratchColor = colorNewCopy(White);
 const scratchAABB = new AABB();
-const ASSET_LOADS_PER_FRAME = 16;
+const ASSET_LOADS_PER_FRAME = 64;
 
 const scratchVec3a = vec3.create();
 const scratchVec3b = vec3.create();
@@ -998,6 +1037,14 @@ export class TheWitnessRenderer implements SceneGfx {
 
         globals.asset_loads_remaining = ASSET_LOADS_PER_FRAME;
 
+        // Entities outside the cluster system -- the water among them -- come first. There are
+        // far fewer of them than there are cluster elements, and going second left them at the
+        // back of a queue the clusters never emptied, so the sea never arrived.
+        for (let i = 0; i < globals.entity_render_list.unclustered_entities.length; i++) {
+            const entity = globals.entity_render_list.unclustered_entities[i];
+            entity.prepareToRender(globals, this.renderHelper.renderInstManager);
+        }
+
         // Go through each entity cluster.
         for (let i = 0; i < globals.entity_render_list.clusters.length; i++) {
             const cluster = globals.entity_render_list.clusters[i];
@@ -1020,10 +1067,6 @@ export class TheWitnessRenderer implements SceneGfx {
             }
         }
 
-        for (let i = 0; i < globals.entity_render_list.unclustered_entities.length; i++) {
-            const entity = globals.entity_render_list.unclustered_entities[i];
-            entity.prepareToRender(globals, this.renderHelper.renderInstManager);
-        }
 
         this.skydome.prepareToRender(globals, this.renderHelper.renderInstManager);
 

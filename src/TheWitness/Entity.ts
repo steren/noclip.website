@@ -56,6 +56,23 @@ export class Entity_Render_List {
             else if (entity.cluster_id === undefined)
                 this.unclustered_entities.push(entity);
         }
+
+        // Biggest first. Only so many entities may build their assets in a frame, and walking
+        // the world in the order it was written spends that on whatever happened to come first
+        // -- a shrub as readily as the sea. Sorting by size puts the terrain, the water and the
+        // headlands at the front, so the shape of the island arrives before its clutter.
+        const by_size = (a: Entity, b: Entity) => b.bounding_radius_world - a.bounding_radius_world;
+        this.clusters.sort(by_size);
+        this.unclustered_entities.sort(by_size);
+
+        // The elements inside each cluster get the same treatment. This runs after the transport
+        // hooks, which is where an entity works out how big it is.
+        for (let i = 0; i < this.clusters.length; i++) {
+            this.clusters[i].elements.sort((a, b) => {
+                const entity_a = globals.entity_manager.entity_list[a], entity_b = globals.entity_manager.entity_list[b];
+                return (entity_b !== undefined ? entity_b.bounding_radius_world : 0.0) - (entity_a !== undefined ? entity_a.bounding_radius_world : 0.0);
+            });
+        }
     }
 }
 
@@ -256,10 +273,18 @@ export class Entity implements Portable {
         if (globals.render_settings.cull_distance_enabled && squared_distance >= this.cull_distance_squared)
             return;
 
-        this.ensure_assets_loaded(globals);
+        if (this.mesh_instance === null) {
+            // Don't spend the frame's asset budget on an entity the camera can't see; a world's
+            // worth of them off screen would otherwise starve the ones in front of us. A radius
+            // of zero means the entity never said how big it is, so let those through.
+            if (this.bounding_radius_world > 0.0 && !globals.viewpoint.frustum.containsSphere(this.bounding_center_world, this.bounding_radius_world))
+                return;
 
-        if (this.mesh_instance === null)
-            return;
+            this.ensure_assets_loaded(globals);
+
+            if (this.mesh_instance === null)
+                return;
+        }
 
         this.mesh_lod = (globals.render_settings.lod_distance_enabled && squared_distance >= this.lod_distance_squared) ? 1 : 0;
 
@@ -286,6 +311,16 @@ export class Entity_Inanimate extends Entity {
             const mesh_asset = globals.asset_manager.load_asset(Asset_Type.Mesh, this.mesh_name);
             this.create_mesh_instance(globals, mesh_asset);
         }
+    }
+}
+
+export class Entity_Lake extends Entity {
+    protected override load_assets(globals: TheWitnessGlobals): void {
+        super.load_assets(globals);
+
+        // A lake's surface is a mesh named after the entity, the same convention clusters use.
+        const mesh_name = `${globals.entity_manager.universe_name}_${this.portable_id}`;
+        this.create_mesh_instance(globals, globals.asset_manager.load_asset(Asset_Type.Mesh, mesh_name));
     }
 }
 
