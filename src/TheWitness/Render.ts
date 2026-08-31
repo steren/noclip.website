@@ -14,7 +14,7 @@ import { GfxRenderHelper } from "../gfx/render/GfxRenderHelper.js";
 import { GfxRendererLayer, GfxRenderInst, GfxRenderInstList, GfxRenderInstManager, makeSortKey, setSortKeyDepth } from "../gfx/render/GfxRenderInstManager.js";
 import { preprocessShader_GLSL } from "../gfx/shaderc/GfxShaderCompiler.js";
 import { hashCodeNumberUpdate, HashMap } from "../HashMap.js";
-import { setMatrixTranslation, Vec3UnitY, Vec3UnitZ } from "../MathHelpers.js";
+import { setMatrixTranslation, Vec3UnitY } from "../MathHelpers.js";
 import { DeviceProgram } from "../Program.js";
 import { UberShaderInstance, UberShaderTemplate } from "../SourceEngine/UberShader.js";
 import { TextureMapping } from "../TextureHolder.js";
@@ -22,7 +22,7 @@ import { nArray } from "../util.js";
 import { SceneGfx, ViewerRenderInput } from "../viewer.js";
 import { Asset_Type, Material_Flags, Material_Type, Mesh_Asset, Render_Material, Texture_Asset } from "./Assets.js";
 import { Entity_World, Lightmap_Table } from "./Entity.js";
-import { TheWitnessGlobals } from "./Globals.js";
+import { noclipSpaceFromTheWitnessSpace, TheWitnessGlobals } from "./Globals.js";
 
 class DepthCopyProgram extends DeviceProgram {
     public override vert = GfxShaderLibrary.fullscreenVS;
@@ -947,8 +947,9 @@ export class TheWitnessRenderer implements SceneGfx {
             return;
         }
 
-        // The world is Z-up, so lift the camera from the marker on the ground to about eye
-        // height, and look the way it faces, levelled off.
+        // Work in The Witness's own space, where Z is up: lift the camera from the marker on the
+        // ground to about eye height, and take the direction it faces with the vertical dropped,
+        // which is what leaves the horizon level.
         vec3.set(scratchVec3a, start.position[0], start.position[1], start.position[2] + 1.7);
         vec3.transformQuat(scratchVec3b, Vec3UnitY, start.orientation);
         scratchVec3b[2] = 0.0;
@@ -957,7 +958,11 @@ export class TheWitnessRenderer implements SceneGfx {
         vec3.normalize(scratchVec3b, scratchVec3b);
         vec3.add(scratchVec3b, scratchVec3a, scratchVec3b);
 
-        mat4.targetTo(dst, scratchVec3a, scratchVec3b, Vec3UnitZ);
+        // The camera matrix is noclip's, so hand both points over to that space, where up is +Y.
+        vec3.transformMat4(scratchVec3a, scratchVec3a, noclipSpaceFromTheWitnessSpace);
+        vec3.transformMat4(scratchVec3b, scratchVec3b, noclipSpaceFromTheWitnessSpace);
+
+        mat4.targetTo(dst, scratchVec3a, scratchVec3b, Vec3UnitY);
     }
 
     private prepareToRender(device: GfxDevice, viewerInput: ViewerRenderInput): void {

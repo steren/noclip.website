@@ -13,7 +13,7 @@ import { Occlusion_Manager } from "./Occlusion.js";
 import { Render_Material_Cache as Device_Material_Cache } from "./Render.js";
 import { DebugDraw } from "../gfx/helpers/DebugDraw.js";
 
-const noclipSpaceFromTheWitnessSpace = mat4.fromValues(
+export const noclipSpaceFromTheWitnessSpace = mat4.fromValues(
     1, 0,  0, 0,
     0, 0, -1, 0,
     0, 1,  0, 0,
