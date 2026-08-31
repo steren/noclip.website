@@ -579,6 +579,9 @@ class Entity_Type_Bridge extends Portable_Type {
         m.add_integer('pivot_id_b', { flags: Metadata_Item_Flags.IS_A_PORTABLE_ID });
         m.add_float('pivot_target_b');
         m.add_float('pivot_t_b');
+        // Added at revision 0x7d. Both read like portable ids, with -1 for none.
+        m.add_integer('unknown_0x7d_a', { minimum_revision_number: 0x7d, flags: Metadata_Item_Flags.IS_A_PORTABLE_ID });
+        m.add_integer('unknown_0x7d_b', { minimum_revision_number: 0x7d, flags: Metadata_Item_Flags.IS_A_PORTABLE_ID });
     }
 }
 
@@ -869,6 +872,8 @@ class Entity_Type_Fog_Marker extends Portable_Type {
         m.add_integer('volumetric_at_quality', { minimum_revision_number: 0x7d, flags: Metadata_Item_Flags.ADJUSTABLE_WITHOUT_RECREATE | Metadata_Item_Flags.DO_NOT_DISPLAY_IN_UI, integer_info: make_boolean_integer_info() });
         m.add_float('volumetric_density_scale', { minimum_revision_number: 0x7e, flags: Metadata_Item_Flags.ADJUSTABLE_WITHOUT_RECREATE | Metadata_Item_Flags.DO_NOT_DISPLAY_IN_UI });
         m.add_float('shadow_brightness', { minimum_revision_number: 0x7e, flags: Metadata_Item_Flags.ADJUSTABLE_WITHOUT_RECREATE | Metadata_Item_Flags.DO_NOT_DISPLAY_IN_UI });
+        // Added at revision 0x81; purpose unknown, and zero throughout this world.
+        m.add_integer('unknown_0x81', { minimum_revision_number: 0x81 });
     }
 }
 
@@ -1247,6 +1252,8 @@ class Entity_Type_Light_Probe extends Portable_Type {
         m.add_color4('color_tint', { minimum_revision_number: 0x6f, flags: Metadata_Item_Flags.ADJUSTABLE_WITHOUT_RECREATE });
         m.add_float('exposure', { minimum_revision_number: 0x6f, flags: Metadata_Item_Flags.ADJUSTABLE_WITHOUT_RECREATE });
         m.add_string('override_env_map', { minimum_revision_number: 0x76 });
+        // Added at revision 0x7e; purpose unknown, and zero throughout this world.
+        m.add_integer('unknown_0x7e', { minimum_revision_number: 0x7e });
     }
 }
 
@@ -1358,22 +1365,9 @@ class Entity_Type_Machine_Panel extends Portable_Type {
         m.add_float('ray_shortening', { minimum_revision_number: 0x5f, flags: Metadata_Item_Flags.DO_NOT_ADD_TO_SAVEGAMES });
         m.add_integer('covert', { minimum_revision_number: 0x60, flags: Metadata_Item_Flags.DO_NOT_ADD_TO_SAVEGAMES, integer_info: make_boolean_integer_info() });
         m.add_integer('has_ever_been_solved', { minimum_revision_number: 0x80, flags: Metadata_Item_Flags.DO_NOT_DISPLAY_IN_UI, integer_info: make_boolean_integer_info() });
-    }
-
-    public override construct_new_obj(portable_id: number, revision_number: number): Entity {
-        return new Entity_Inanimate(portable_id, revision_number);
-    }
-}
-
-// The player. The rest of its data is unimplemented -- unpacking stops after the fields every
-// entity has, and load_entities resyncs past the remainder -- but those fields include the
-// position the game starts you at, which is where the camera wants to start too.
-class Entity_Type_Human extends Portable_Type {
-    public static Type_Name = 'Human';
-
-    constructor() {
-        super();
-        make_entity_metadata(this.metadata);
+        // Added at revision 0x89. Purpose unknown -- it reads as a distance or scale, with -1
+        // standing in for unset -- but the record is 4 bytes longer without it.
+        m.add_float('unknown_0x89', { minimum_revision_number: 0x89 });
     }
 
     public override construct_new_obj(portable_id: number, revision_number: number): Entity {
@@ -1588,6 +1582,11 @@ class Entity_Type_Particle_Source extends Portable_Type {
         m.add_integer('billboard', { minimum_revision_number: 0x61, flags: Metadata_Item_Flags.DO_NOT_DISPLAY_IN_UI, integer_info: make_boolean_integer_info() });
         m.add_integer('billboard_type', { minimum_revision_number: 0x88, integer_info: make_enum_integer_info(['Flat', 'Billboard', 'WorldUp'], true) });
         m.add_float('tex_mip_bias', { minimum_revision_number: 0x88, flags: Metadata_Item_Flags.ADJUSTABLE_WITHOUT_RECREATE });
+        // Added at revision 0x8f. Purpose unknown, and zero throughout this world; it has to be
+        // read here rather than at the end, or the particle path below reads a garbage length and
+        // runs off the end of the world. Its exact place among the fields of the same width around
+        // it can't be pinned down any further than this.
+        m.add_float('unknown_0x8f', { minimum_revision_number: 0x8f });
         const stretch_particles = m.add_integer('stretch_particles', { minimum_revision_number: 0x66, flags: Metadata_Item_Flags.DO_NOT_DISPLAY_IN_UI, integer_info: make_boolean_integer_info() });
         m.add_float('stretch_factor', { predicated_upon: stretch_particles, minimum_revision_number: 0x66, flags: Metadata_Item_Flags.PREDICATED_ON_TRUTH | Metadata_Item_Flags.DO_NOT_DISPLAY_IN_UI });
         m.add_integer('force_continuous_update', { minimum_revision_number: 0x7d, integer_info: make_boolean_integer_info() });
@@ -2053,7 +2052,6 @@ class Portable_Type_Manager {
         this.register_type(Entity_Type_Light);
         this.register_type(Entity_Type_Light_Probe);
         this.register_type(Entity_Type_Machine_Panel);
-        this.register_type(Entity_Type_Human);
         this.register_type(Entity_Type_Marker);
         this.register_type(Entity_Type_Multipanel);
         this.register_type(Entity_Type_Note);
@@ -2085,6 +2083,29 @@ class Portable_Type_Manager {
     }
 }
 
+// Revisions of the types whose newest fields this file reads. Data older than these is missing
+// them, and while the metadata's revision gates handle that, it isn't a combination anything
+// here has been checked against.
+const EXPECTED_TYPE_REVISIONS: [string, number][] = [
+    ['Bridge', 0x7d],
+    ['Light_Probe', 0x7e],
+    ['Fog_Marker', 0x81],
+    ['Machine_Panel', 0x89],
+    ['Particle_Source', 0x8f],
+];
+
+function check_type_revisions(info: Portable_Type_Load_Info[]): void {
+    const older: string[] = [];
+    for (const [name, expected] of EXPECTED_TYPE_REVISIONS) {
+        const entry = info.find((x) => x.name === name);
+        if (entry !== undefined && entry.revision_number < expected)
+            older.push(`${name} is revision ${entry.revision_number}, expected ${expected}`);
+    }
+
+    if (older.length > 0)
+        console.error(`TheWitness: this world is older than the game build this importer was written against (${older.join('; ')}).`);
+}
+
 function load_type_manifest(stream: Stream): Portable_Type_Load_Info[] {
     const manager = new Portable_Type_Manager();
 
@@ -2097,6 +2118,8 @@ function load_type_manifest(stream: Stream): Portable_Type_Load_Info[] {
         const portable_type = manager.get_portable_type_from_name(name);
         info.push({ name, portable_type, revision_number });
     }
+
+    check_type_revisions(info);
     return info;
 }
 
@@ -2117,6 +2140,10 @@ const RESYNC_CONFIRM_DEPTH = 4;
 // array count read out of misaligned data runs off the end of the buffer immediately rather
 // than allocating its way through the rest of the world.
 const RESYNC_PROBE_WINDOW = 0x400;
+// Checking that a record we just unpacked ends on another one reads real data, so it can afford
+// a window big enough for the longest records; the scan below reads garbage by design and pays
+// for every byte of slack it is given.
+const RECORD_PROBE_WINDOW = 0x4000;
 const RESYNC_DELTA_WINDOW = 0x100;
 
 function unpack_entity(stream: Stream, type_manifest: Portable_Type_Load_Info[]): Entity | null {
@@ -2145,18 +2172,48 @@ function is_record_head(buffer: ArrayBufferSlice, view: DataView, type_manifest:
     return portable_type_info !== undefined && portable_type_info.portable_type !== null && portable_type_info.portable_type !== undefined;
 }
 
+// Did the record we just unpacked end where another one begins? A type we don't implement can't
+// be unpacked to prove it, but its header names a type in the manifest, and that is where the
+// record before it ended -- treating that as a failure would throw away the record we just read.
+function ends_on_a_record(buffer: ArrayBufferSlice, view: DataView, type_manifest: Portable_Type_Load_Info[], offs: number): boolean {
+    if (offs === buffer.byteLength)
+        return true;
+    if (offs + 0x05 > buffer.byteLength)
+        return false;
+
+    const portable_type_info = type_manifest[view.getUint8(offs + 0x04)];
+    if (portable_type_info === undefined)
+        return false;
+    if (portable_type_info.portable_type === null || portable_type_info.portable_type === undefined)
+        return true;
+
+    return records_unpack_at(buffer, type_manifest, offs, 1, RECORD_PROBE_WINDOW);
+}
+
 // Do `depth` records unpack cleanly starting at `offs`?
-function records_unpack_at(buffer: ArrayBufferSlice, type_manifest: Portable_Type_Load_Info[], offs: number, depth: number): boolean {
+function records_unpack_at(buffer: ArrayBufferSlice, type_manifest: Portable_Type_Load_Info[], offs: number, depth: number, window: number = RESYNC_PROBE_WINDOW): boolean {
     if (offs < 0 || offs >= buffer.byteLength)
         return false;
 
     try {
-        const end = Math.min(offs + depth * RESYNC_PROBE_WINDOW, buffer.byteLength);
+        const end = Math.min(offs + depth * window, buffer.byteLength);
         const stream = new Stream(buffer.slice(offs, end));
 
         for (let i = 0; i < depth; i++) {
             if (offs + stream.offset === buffer.byteLength)
                 return true;
+
+            // A record of a type we can't unpack in full is still a record: its header names a
+            // type in the manifest, which is all a boundary needs to be plausible.
+            const head = stream.offset;
+            stream.readUint32();
+            const portable_type_info = type_manifest[stream.readValue(0xFF)];
+            if (portable_type_info === undefined)
+                return false;
+            if (portable_type_info.portable_type === null || portable_type_info.portable_type === undefined)
+                return true;
+
+            stream.offset = head;
             if (unpack_entity(stream, type_manifest) === null)
                 return false;
         }
@@ -2242,7 +2299,7 @@ export function load_entities(version: number, buffer: ArrayBufferSlice): Entity
                 parse_end = stream.offset;
                 // Unpacking against a stale revision can consume a plausible but wrong number
                 // of bytes, so only trust a record that leaves us on another one.
-                in_sync = parse_end === buffer.byteLength || records_unpack_at(buffer, type_manifest, parse_end, 1);
+                in_sync = ends_on_a_record(buffer, view, type_manifest, parse_end);
             }
         } catch (e) {
             entity = null;

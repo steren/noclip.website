@@ -1,5 +1,5 @@
 
-import { mat4, quat, ReadonlyMat4, vec3 } from "gl-matrix";
+import { mat4, ReadonlyMat4, vec3 } from "gl-matrix";
 import { CameraController } from "../Camera.js";
 import { Color, colorCopy, colorNewCopy, colorNewFromRGBA, Red, White } from "../Color.js";
 import { AABB } from "../Geometry.js";
@@ -14,7 +14,7 @@ import { GfxRenderHelper } from "../gfx/render/GfxRenderHelper.js";
 import { GfxRendererLayer, GfxRenderInst, GfxRenderInstList, GfxRenderInstManager, makeSortKey, setSortKeyDepth } from "../gfx/render/GfxRenderInstManager.js";
 import { preprocessShader_GLSL } from "../gfx/shaderc/GfxShaderCompiler.js";
 import { hashCodeNumberUpdate, HashMap } from "../HashMap.js";
-import { setMatrixTranslation, Vec3NegY, Vec3UnitY, Vec3UnitZ } from "../MathHelpers.js";
+import { setMatrixTranslation, Vec3UnitY, Vec3UnitZ } from "../MathHelpers.js";
 import { DeviceProgram } from "../Program.js";
 import { UberShaderInstance, UberShaderTemplate } from "../SourceEngine/UberShader.js";
 import { TextureMapping } from "../TextureHolder.js";
@@ -940,21 +940,17 @@ export class TheWitnessRenderer implements SceneGfx {
     }
 
     public getDefaultWorldMatrix(dst: mat4): void {
-        // Start the camera where the game starts the player. Records we resynced past can be
-        // mistaken for the player -- several claim its portable_id of 0 -- but they carry a
-        // zeroed orientation, which a real one never does.
-        const player = this.globals.entity_manager.flat_entity_list.find((e) => {
-            return e.type_name === 'Entity_Type_Human' && Math.abs(quat.length(e.orientation) - 1.0) < 0.01;
-        });
-        if (player === undefined) {
+        // Start the camera where the game starts the player: a marker the world names ':start'.
+        const start = this.globals.entity_manager.flat_entity_list.find((e) => e.entity_name === ':start');
+        if (start === undefined) {
             mat4.identity(dst);
             return;
         }
 
-        // The world is Z-up, so lift the camera from the player's feet to about eye height and
-        // look along the direction they're facing, levelled off.
-        vec3.set(scratchVec3a, player.position[0], player.position[1], player.position[2] + 1.7);
-        vec3.transformQuat(scratchVec3b, Vec3NegY, player.orientation);
+        // The world is Z-up, so lift the camera from the marker on the ground to about eye
+        // height, and look the way it faces, levelled off.
+        vec3.set(scratchVec3a, start.position[0], start.position[1], start.position[2] + 1.7);
+        vec3.transformQuat(scratchVec3b, Vec3UnitY, start.orientation);
         scratchVec3b[2] = 0.0;
         if (vec3.squaredLength(scratchVec3b) < 0.0001)
             vec3.copy(scratchVec3b, Vec3UnitY);

@@ -53,6 +53,20 @@ enum Texture_Asset_Flags {
     Is_Cube         = 0x08,
 }
 
+// The versions this importer was built against. The layouts below describe these and only
+// these; older data arranges its fields differently, so say so rather than misreading it.
+const TEXTURE_ASSET_VERSION = 0x16;
+const LIGHTMAP_ASSET_VERSION = 0x13;
+const MESH_ASSET_VERSION = 0x31;
+
+function assert_asset_version(kind: string, name: string, version: number, expected: number): void {
+    if (version >= expected)
+        return;
+
+    console.error(`TheWitness: ${kind} '${name}' is version 0x${version.toString(16)}, older than the 0x${expected.toString(16)} this supports -- your copy of the game predates what this importer was written against.`);
+    throw new Error(`${kind} '${name}' is version 0x${version.toString(16)}, expected 0x${expected.toString(16)} or newer`);
+}
+
 enum D3DFormat {
     DXT1 = 0x31545844,
     DXT5 = 0x35545844,
@@ -62,6 +76,7 @@ enum D3DFormat {
     X8R8G8B8 = 0x16,
     L16      = 0x51,
     A8       = 0x1C,
+    A8L8     = 0x33,
 }
 
 function get_gfx_format(format: D3DFormat, srgb: boolean): GfxFormat {
@@ -81,6 +96,8 @@ function get_gfx_format(format: D3DFormat, srgb: boolean): GfxFormat {
         return GfxFormat.U16_R_NORM;
     else if (format === D3DFormat.A8)
         return GfxFormat.U8_R_NORM;
+    else if (format === D3DFormat.A8L8)
+        return GfxFormat.U8_RG_NORM;
     else
         throw new Error(`unsupported D3D texture format 0x${(format as number).toString(16)}`);
 }
@@ -122,6 +139,8 @@ function get_mipmap_size(format: D3DFormat, width: number, height: number, depth
             return num_pixels * 2;
         else if (format === D3DFormat.A8)
             return num_pixels;
+        else if (format === D3DFormat.A8L8)
+            return num_pixels * 2;
         else
             throw new Error("whoops");
     }
@@ -175,8 +194,7 @@ export class Texture_Asset {
     private texture: GfxTexture;
 
     constructor(device: GfxDevice, version: number, stream: Stream, name: string) {
-        // 0x16 lays the levels out the same way, and parks a 64x64 alpha mask after them.
-        assert(version === 0x12 || version === 0x16);
+        assert_asset_version('texture', name, version, TEXTURE_ASSET_VERSION);
 
         // Texture_Asset
         this.width = stream.readUint16();
@@ -245,16 +263,11 @@ export class Lightmap_Asset {
     private texture: GfxTexture;
 
     constructor(device: GfxDevice, version: number, stream: Stream, name: string) {
-        // Version 0x13 dropped `vertex_count` here, along with the two OpenGL ES format fields
-        // that used to follow the D3D one; its pixel data starts right after `d3d_format`.
-        const has_legacy_fields = version < 0x13;
+        assert_asset_version('lightmap', name, version, LIGHTMAP_ASSET_VERSION);
 
         const checksum = stream.readUint32();
         this.width = stream.readUint16();
         this.height = stream.readUint16();
-
-        if (has_legacy_fields)
-            stream.readUint32(); // vertex_count
 
         const generator_version = stream.readUint32();
         const bounce_count = stream.readUint32();
@@ -264,12 +277,9 @@ export class Lightmap_Asset {
 
         const pixel_data_size = stream.readUint32();
         this.color_range = stream.readFloat32();
+        // The pixel data starts right here: 0x13 dropped the OpenGL ES format fields that used
+        // to follow, along with the `vertex_count` that preceded the timestamps.
         const d3d_format = stream.readUint32();
-
-        if (has_legacy_fields) {
-            stream.readUint32(); // ogles_internal_format
-            stream.readUint32(); // ogles_type
-        }
 
         this.texture = device.createTexture(makeTextureDescriptor2D(get_gfx_format(d3d_format, false), this.width, this.height, 1));
         device.setResourceName(this.texture, name);
@@ -445,15 +455,16 @@ function Stream_read_Array_uchar(stream: Stream): ArrayBufferSlice {
     return stream.readBytes(count);
 }
 
-function unpack_Sub_Mesh_Asset(stream: Stream, version: number): Sub_Mesh_Asset {
+function unpack_Sub_Mesh_Asset(stream: Stream): Sub_Mesh_Asset {
     const material_index = stream.readUint32();
     const vertex_attribute_flags = stream.readUint32();
     const vertex_size = stream.readUint32();
     const vertex_count = stream.readUint32();
     const index_count = stream.readUint32();
-    // Version 0x31 dropped max_instance_count; only the detail level is left here. Reading both
-    // takes the index array's length as the detail level and the first indices as that length.
-    const max_instance_count = version >= 0x31 ? 1 : stream.readUint32();
+    // Only the detail level sits here; reading a max_instance_count ahead of it, as older data
+    // carried, takes the index array's length as the detail level and the first indices as that
+    // length.
+    const max_instance_count = 1;
     const detail_level = stream.readUint32();
     const index_data = Stream_read_Array_uchar(stream);
     const vertex_data = Stream_read_Array_uchar(stream);
@@ -673,6 +684,8 @@ export class Mesh_Asset {
     public device_mesh_array: Device_Mesh[] = [];
 
     constructor(cache: GfxRenderCache, version: number, stream: Stream, name: string) {
+        assert_asset_version('mesh', name, version, MESH_ASSET_VERSION);
+
         this.checksum = stream.readUint32();
         this.flags = stream.readUint32();
         this.max_lod_count = stream.readUint32();
@@ -680,18 +693,16 @@ export class Mesh_Asset {
         this.sphere = Stream_read_Bounding_Sphere(stream);
         this.lightmap_size = Stream_read_Vector2(stream);
 
-        // Version 0x31 added two vectors here, ahead of the material array. Reading the array
-        // without them takes the first of those floats as its length, which asks for a billion
-        // materials and takes the renderer process with it.
-        if (version >= 0x31) {
-            Stream_read_Vector3(stream);
-            Stream_read_Vector3(stream);
-        }
+        // Two vectors sit between the lightmap size and the material array. Skipping them takes
+        // the first of their floats as the array's length, which asks for a billion materials
+        // and takes the renderer process with it.
+        Stream_read_Vector3(stream);
+        Stream_read_Vector3(stream);
 
         const material_array = unpack_Array(stream, unpack_Render_Material);
 
-        const sub_mesh_array = unpack_Array(stream, (s) => unpack_Sub_Mesh_Asset(s, version));
-        const z_sub_mesh_array = unpack_Array(stream, (s) => unpack_Sub_Mesh_Asset(s, version));
+        const sub_mesh_array = unpack_Array(stream, unpack_Sub_Mesh_Asset);
+        const z_sub_mesh_array = unpack_Array(stream, unpack_Sub_Mesh_Asset);
 
         this.material_array = material_array;
         this.device_mesh_array = sub_mesh_array.map((asset) => new Device_Mesh(cache, this, asset));
