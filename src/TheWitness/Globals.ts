@@ -7,6 +7,7 @@ import { Frustum } from "../Geometry.js";
 import { getMatrixTranslation } from "../MathHelpers.js";
 import { Camera } from "../Camera.js";
 import { GfxRenderCache } from "../gfx/render/GfxRenderCache.js";
+import { GfxRenderInstList } from "../gfx/render/GfxRenderInstManager.js";
 import { assert, decodeString } from "../util.js";
 import ArrayBufferSlice from "../ArrayBufferSlice.js";
 import { Occlusion_Manager } from "./Occlusion.js";
@@ -123,6 +124,8 @@ export class TheWitnessGlobals {
     public scene_time = 0.0;
     // How many more entities may create their assets this frame; see Entity.ensure_assets_loaded.
     public asset_loads_remaining = 0;
+    // Water is drawn in a pass of its own, after the scene it looks through; see Render.ts.
+    public water_render_inst_list: GfxRenderInstList | null = null;
 
     constructor(public device: GfxDevice, public asset_manager: Asset_Manager) {
         this.renderCache = new GfxRenderCache(this.device);

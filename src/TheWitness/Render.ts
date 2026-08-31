@@ -7,7 +7,7 @@ import { fullscreenMegaState, setAttachmentStateSimple } from "../gfx/helpers/Gf
 import { GfxShaderLibrary } from "../gfx/helpers/GfxShaderLibrary.js";
 import { makeBackbufferDescSimple, standardFullClearRenderPassDescriptor } from "../gfx/helpers/RenderGraphHelpers.js";
 import { fillColor, fillMatrix4x3, fillMatrix4x4, fillVec3v, fillVec4, fillVec4v } from "../gfx/helpers/UniformBufferHelpers.js";
-import { GfxBindingLayoutDescriptor, GfxBlendFactor, GfxBlendMode, GfxCullMode, GfxDevice, GfxFormat, GfxMegaStateDescriptor, GfxMipFilterMode, GfxProgram, GfxRenderProgramDescriptor, GfxSampler, GfxTexFilterMode, GfxWrapMode } from "../gfx/platform/GfxPlatform.js";
+import { GfxBindingLayoutDescriptor, GfxBindingLayoutSamplerDescriptor, GfxBlendFactor, GfxBlendMode, GfxCullMode, GfxDevice, GfxFormat, GfxMegaStateDescriptor, GfxMipFilterMode, GfxProgram, GfxRenderProgramDescriptor, GfxSampler, GfxSamplerFormatKind, GfxTexFilterMode, GfxTextureDimension, GfxWrapMode } from "../gfx/platform/GfxPlatform.js";
 import { GfxRenderCache } from "../gfx/render/GfxRenderCache.js";
 import { GfxrAttachmentSlot, GfxrRenderTargetDescription } from "../gfx/render/GfxRenderGraph.js";
 import { GfxRenderHelper } from "../gfx/render/GfxRenderHelper.js";
@@ -23,6 +23,7 @@ import { SceneGfx, ViewerRenderInput } from "../viewer.js";
 import { Asset_Type, Material_Flags, Material_Type, Mesh_Asset, Render_Material, Texture_Asset } from "./Assets.js";
 import { Entity_World, Lightmap_Table } from "./Entity.js";
 import { noclipSpaceFromTheWitnessSpace, TheWitnessGlobals } from "./Globals.js";
+import { Post_Process } from "./PostProcess.js";
 
 class DepthCopyProgram extends DeviceProgram {
     public override vert = GfxShaderLibrary.fullscreenVS;
@@ -82,6 +83,7 @@ ${GfxShaderLibrary.MatrixLibrary}
 
 layout(std140) uniform ub_SceneParams {
     Mat4x4 u_ViewProjection;
+    Mat4x4 u_WorldFromClip;
     vec4 u_CameraPosWorld;
     vec4 u_KeyLightDir;
     vec4 u_KeyLightColor;
@@ -89,10 +91,14 @@ layout(std140) uniform ub_SceneParams {
     vec4 u_FogColor;
     vec4 u_FogSkyColor;
     vec4 u_FogSunColor;
+    // xyz: what the sky says the baked light is worth (lightmap_color * lightmap_brightness).
+    // w: the sky's own brightness.
+    vec4 u_LightMapScale;
 };
 
 #define u_WindDirection (vec3(u_CameraPosWorld.w, u_KeyLightDir.w, 0.0))
 #define u_SceneTime (u_KeyLightColor.w)
+#define u_SkyBrightness (u_LightMapScale.w)
 
 layout(std140) uniform ub_ObjectParams {
     Mat3x4 u_ModelMatrix;
@@ -128,6 +134,10 @@ uniform sampler2D u_LightMap0;
 uniform sampler2D u_LightMap1;
 
 uniform sampler2D u_TerrainColor;
+
+// The scene as it stood before the water was drawn over it; see the 'Water' pass.
+uniform sampler2D u_SceneColor;
+uniform sampler2D u_SceneDepth;
 
 ${GfxShaderLibrary.saturate}
 ${GfxShaderLibrary.CalcScaleBias}
@@ -418,6 +428,7 @@ vec3 CalcNormalMap() {
 // reflects it, so the two always agree about what the sky looks like.
 vec3 CalcSkyColor(in vec3 t_Direction) {
     vec3 t_Color = u_FogSkyColor.rgb;
+    // Everything below mixes between colours, so the sky's brightness goes on at the end.
 
     float t_FogColorAmount = pow(saturate(1.0 - t_Direction.z), u_FogColor.a);
     t_Color.rgb = mix(t_Color.rgb, u_FogColor.rgb, t_FogColorAmount);
@@ -426,7 +437,7 @@ vec3 CalcSkyColor(in vec3 t_Direction) {
     float t_FogSunColorAmount = pow(t_SunAmount, 8.0);
     t_Color.rgb = mix(t_Color.rgb, u_FogSunColor.rgb, t_FogSunColorAmount);
 
-    return t_Color;
+    return t_Color * u_SkyBrightness;
 }
 
 vec4 CalcAlbedo() {
@@ -518,7 +529,7 @@ void mainPS() {
             t_LightMapSample *= HalfLambert(dot(t_NormalWorld, t_NormalWorldSurface));
         }
 
-        t_DiffuseLight += t_LightMapSample;
+        t_DiffuseLight += t_LightMapSample * u_LightMapScale.rgb;
         t_HasIncomingLight = true;
     }
 
@@ -548,6 +559,21 @@ void mainPS() {
 
     bool use_lake = ${this.is_type(m, Material_Type.Lake)};
     if (use_lake) {
+        // What the scene looked like where this pixel is, before the water went over it. The
+        // fragment coordinate indexes the framebuffer directly, so it needs no flipping.
+        vec2 t_ScreenUV = gl_FragCoord.xy / vec2(textureSize(TEXTURE(u_SceneDepth), 0));
+        float t_SceneDepthSample = texture(SAMPLER_2D(u_SceneDepth), t_ScreenUV).r;
+
+        // Turn that depth back into a world position, so the distance down through the water is
+        // just the drop from this surface to whatever lies under it.
+        vec4 t_PosClip = vec4(t_ScreenUV.xy * 2.0 - 1.0, t_SceneDepthSample, 1.0);
+#if !GFX_CLIPSPACE_NEAR_ZERO()
+        t_PosClip.z = t_PosClip.z * 2.0 - 1.0;
+#endif
+        vec4 t_PosWorld = UnpackMatrix(u_WorldFromClip) * t_PosClip;
+        vec3 t_BottomWorld = t_PosWorld.xyz / t_PosWorld.www;
+        float t_WaterDepth = max(v_PositionWorld.z - t_BottomWorld.z, 0.0);
+
         // Ripples: two slow wave trains crossing each other, tilting the surface a little. The
         // amplitude is small on purpose -- the island's water is nearly a mirror.
         vec2 t_WavePos = v_PositionWorld.xy;
@@ -564,10 +590,15 @@ void mainPS() {
         float t_ViewDot = saturate(dot(t_WaterNormal, t_WorldDirectionToEye));
         float t_Fresnel = 0.02 + 0.98 * pow(1.0 - t_ViewDot, 5.0);
 
-        // Looking into the water, from a shallow blue-green to the deep blue further out.
-        vec3 t_ShallowColor = vec3(0.014, 0.153, 0.216);
-        vec3 t_DeepColor = vec3(0.004, 0.032, 0.083);
-        vec3 t_WaterColor = mix(t_DeepColor, t_ShallowColor, t_ViewDot);
+        // Looking into the water: the bottom, dimmed by however much water stands over it. A
+        // metre of it barely tints the sand; ten metres of it is just blue. Light travelling
+        // down and back means the path is twice the depth.
+        vec3 t_Bottom = texture(SAMPLER_2D(u_SceneColor), t_ScreenUV).rgb;
+        vec3 t_Extinction = vec3(0.29, 0.086, 0.062);
+        vec3 t_Transmittance = exp(-t_Extinction * (t_WaterDepth * 2.0));
+
+        vec3 t_DeepColor = vec3(0.004, 0.033, 0.084);
+        vec3 t_WaterColor = t_Bottom * t_Transmittance + t_DeepColor * (1.0 - t_Transmittance);
 
         t_FinalColor = mix(t_WaterColor, t_SkyReflection, t_Fresnel);
 
@@ -578,9 +609,8 @@ void mainPS() {
 
     // TODO(jstpierre): Fog
 
-    // Tone mapping & gamma correction
-    CalcToneMap(t_FinalColor.rgb);
-    t_FinalColor = pow(t_FinalColor, vec3(1.0 / 2.2));
+    // The scene is drawn in HDR; exposure, the filmic curve and the vignette come later, in
+    // PostProcess.ts, the way the game does them.
 
     float t_Alpha = 1.0;
     bool use_albedo_alpha = ${this.is_type(m, Material_Type.Vegetation) || this.is_type(m, Material_Type.Foliage) || this.is_type(m, Material_Type.Translucent) || this.is_type(m, Material_Type.Cloud)};
@@ -709,6 +739,7 @@ const ASSET_LOADS_PER_FRAME = 64;
 
 const scratchVec3a = vec3.create();
 const scratchVec3b = vec3.create();
+const scratchMatrix = mat4.create();
 class Device_Material {
     public visible: boolean = true;
 
@@ -716,6 +747,7 @@ class Device_Material {
     private gfx_program: GfxProgram;
     private texture_map: (Texture_Asset | null)[] = nArray(3, () => null);
     private texture_mapping_array: TextureMapping[] = nArray(12, () => new TextureMapping());
+    public is_water: boolean = false;
 
     public sortKeyBase = 0;
     public megaStateFlags: Partial<GfxMegaStateDescriptor> = {};
@@ -763,6 +795,14 @@ class Device_Material {
 
         this.shader_instance = globals.device_material_cache.create_shader_instance(this.render_material);
         this.gfx_program = this.shader_instance.getGfxProgram(globals.renderCache);
+
+        // Water draws in its own pass, once the rest of the scene is there to be seen through it.
+        this.is_water = material_type === Material_Type.Lake;
+        if (this.is_water) {
+            this.texture_mapping_array.push(new TextureMapping(), new TextureMapping());
+            this.texture_mapping_array[12].lateBinding = 'scene-color';
+            this.texture_mapping_array[13].lateBinding = 'scene-depth';
+        }
 
         // Disable invisible material types.
         if (material_type === Material_Type.Collision_Only || material_type === Material_Type.Occluder)
@@ -813,7 +853,7 @@ class Device_Material {
 
             lightmap0Blend *= params.lightmap_table.current_page.color_range;
             if (params.lightmap_table.next_page !== null)
-                lightmap0Blend *= params.lightmap_table.next_page.color_range;
+                lightmap1Blend *= params.lightmap_table.next_page.color_range;
         }
 
         const emission_scale = 10.0;
@@ -906,13 +946,21 @@ export class Mesh_Instance {
             device_material.setOnRenderInst(renderInst, params);
             device_material.fillMaterialParams(globals, renderInst, params);
             renderInst.sortKey = setSortKeyDepth(renderInst.sortKey, depth);
-            renderInstManager.submitRenderInst(renderInst);
+            if (device_material.is_water && globals.water_render_inst_list !== null)
+                globals.water_render_inst_list.submitRenderInst(renderInst);
+            else
+                renderInstManager.submitRenderInst(renderInst);
         }
     }
 }
 
+// The scene depth the water reads is a depth texture, and the platform checks that the shader
+// says so; everything else here is an ordinary colour map.
+const samplerEntries: GfxBindingLayoutSamplerDescriptor[] = nArray(16, () => ({ dimension: GfxTextureDimension.n2D, formatKind: GfxSamplerFormatKind.Float }));
+samplerEntries[13] = { dimension: GfxTextureDimension.n2D, formatKind: GfxSamplerFormatKind.Depth, comparison: false };
+
 const bindingLayouts: GfxBindingLayoutDescriptor[] = [
-    { numUniformBuffers: 2, numSamplers: 16, },
+    { numUniformBuffers: 2, numSamplers: 16, samplerEntries, },
 ];
 
 class Skydome {
@@ -960,18 +1008,39 @@ export class Cached_Shadow_Map {
 export class TheWitnessRenderer implements SceneGfx {
     public renderHelper: GfxRenderHelper;
     private renderInstListMain = new GfxRenderInstList();
+    private renderInstListWater = new GfxRenderInstList();
 
     private skydome: Skydome;
     private cached_shadow_map: Cached_Shadow_Map | null = null;
 
+    private post_process: Post_Process;
+    private sceneColorSampler: GfxSampler;
+    private sceneDepthSampler: GfxSampler;
+
     constructor(device: GfxDevice, private globals: TheWitnessGlobals) {
         this.renderHelper = new GfxRenderHelper(device);
+        this.sceneColorSampler = this.renderHelper.renderCache.createSampler({
+            minFilter: GfxTexFilterMode.Bilinear,
+            magFilter: GfxTexFilterMode.Bilinear,
+            mipFilter: GfxMipFilterMode.Nearest,
+            wrapS: GfxWrapMode.Clamp,
+            wrapT: GfxWrapMode.Clamp,
+        });
+        this.sceneDepthSampler = this.renderHelper.renderCache.createSampler({
+            minFilter: GfxTexFilterMode.Point,
+            magFilter: GfxTexFilterMode.Point,
+            mipFilter: GfxMipFilterMode.Nearest,
+            wrapS: GfxWrapMode.Clamp,
+            wrapT: GfxWrapMode.Clamp,
+        });
         this.skydome = new Skydome(globals);
 
         const world = this.globals.entity_manager.flat_entity_list.find((e) => e instanceof Entity_World) as Entity_World;
         // this.cached_shadow_map = new Cached_Shadow_Map(globals, world);
 
         globals.debug_draw = this.renderHelper.debugDraw;
+        globals.water_render_inst_list = this.renderInstListWater;
+        this.post_process = new Post_Process(device, this.renderHelper);
     }
 
     public adjustCameraController(c: CameraController): void {
@@ -989,7 +1058,7 @@ export class TheWitnessRenderer implements SceneGfx {
         // Work in The Witness's own space, where Z is up: lift the camera from the marker on the
         // ground to about eye height, and take the direction it faces with the vertical dropped,
         // which is what leaves the horizon level.
-        vec3.set(scratchVec3a, start.position[0], start.position[1], start.position[2] + 1.7);
+        vec3.set(scratchVec3a, start.position[0], start.position[1], start.position[2] + 1.69);
         vec3.transformQuat(scratchVec3b, Vec3UnitY, start.orientation);
         scratchVec3b[2] = 0.0;
         if (vec3.squaredLength(scratchVec3b) < 0.0001)
@@ -1018,9 +1087,11 @@ export class TheWitnessRenderer implements SceneGfx {
         viewpoint.setupFromCamera(viewerInput.camera);
         this.renderHelper.debugDraw.beginFrame(viewpoint.clipFromViewMatrix, viewpoint.viewFromWorldMatrix, viewerInput.backbufferWidth, viewerInput.backbufferHeight);
 
-        let offs = template.allocateUniformBuffer(TheWitnessShaderTemplate.ub_SceneParams, 44);
+        let offs = template.allocateUniformBuffer(TheWitnessShaderTemplate.ub_SceneParams, 64);
         const d = template.mapUniformBufferF32(TheWitnessShaderTemplate.ub_SceneParams);
         offs += fillMatrix4x4(d, offs, viewpoint.clipFromWorldMatrix);
+        mat4.invert(scratchMatrix, viewpoint.clipFromWorldMatrix);
+        offs += fillMatrix4x4(d, offs, scratchMatrix);
         offs += fillVec3v(d, offs, viewpoint.cameraPos, misc.wind_x as number);
 
         vec3.set(scratchVec3a, misc.sun_x as number, misc.sun_y as number, misc.sun_z as number);
@@ -1032,6 +1103,14 @@ export class TheWitnessRenderer implements SceneGfx {
         offs += fillVec4(d, offs, render_sky.fog_color_x as number, render_sky.fog_color_y as number, render_sky.fog_color_z as number, render_sky.fog_sky_blend as number);
         offs += fillVec4(d, offs, render_sky.fog_sky_color_x as number, render_sky.fog_sky_color_y as number, render_sky.fog_sky_color_z as number);
         offs += fillVec4(d, offs, render_sky.fog_sun_color_x as number, render_sky.fog_sun_color_y as number, render_sky.fog_sun_color_z as number);
+
+        // The baked lighting carries the image in this game; the sky says how much it is worth.
+        const lightmap_brightness = render_sky.lightmap_brightness as number;
+        offs += fillVec4(d, offs,
+            (render_sky.lightmap_color_x as number) * lightmap_brightness,
+            (render_sky.lightmap_color_y as number) * lightmap_brightness,
+            (render_sky.lightmap_color_z as number) * lightmap_brightness,
+            render_sky.brightness as number);
 
         globals.occlusion_manager.prepareToRender(globals, this.renderHelper.renderInstManager);
 
@@ -1114,7 +1193,9 @@ export class TheWitnessRenderer implements SceneGfx {
             });
         }
 
+        // The scene is rendered in float, so the sun and sky keep their range until tone mapping.
         const mainColorDesc = makeBackbufferDescSimple(GfxrAttachmentSlot.Color0, viewerInput, standardFullClearRenderPassDescriptor);
+        mainColorDesc.pixelFormat = GfxFormat.F16_RGBA;
         const mainDepthDesc = makeBackbufferDescSimple(GfxrAttachmentSlot.DepthStencil, viewerInput, standardFullClearRenderPassDescriptor);
 
         const mainColorTargetID = builder.createRenderTargetID(mainColorDesc, 'Main Color');
@@ -1127,14 +1208,41 @@ export class TheWitnessRenderer implements SceneGfx {
                 this.renderInstListMain.drawOnPassRenderer(this.renderHelper.renderCache, passRenderer);
             });
         });
+        // The water goes over the finished scene, reading the colour and depth of what it stands
+        // in front of so it can work out how deep it is at each pixel. The pass is built before
+        // prepareToRender has filled any list, so it goes in unconditionally; with no water in
+        // front of the camera it draws nothing.
+        {
+            builder.pushPass((pass) => {
+                pass.setDebugName('Water');
+                pass.attachRenderTargetID(GfxrAttachmentSlot.Color0, mainColorTargetID);
+                pass.attachRenderTargetID(GfxrAttachmentSlot.DepthStencil, mainDepthTargetID);
+
+                const sceneColorResolveTextureID = builder.resolveRenderTarget(mainColorTargetID);
+                pass.attachResolveTexture(sceneColorResolveTextureID);
+                const sceneDepthResolveTextureID = builder.resolveRenderTarget(mainDepthTargetID);
+                pass.attachResolveTexture(sceneDepthResolveTextureID);
+
+                pass.exec((passRenderer, scope) => {
+                    this.renderInstListWater.resolveLateSamplerBinding('scene-color', { gfxTexture: scope.getResolveTextureForID(sceneColorResolveTextureID), gfxSampler: this.sceneColorSampler, lateBinding: undefined });
+                    this.renderInstListWater.resolveLateSamplerBinding('scene-depth', { gfxTexture: scope.getResolveTextureForID(sceneDepthResolveTextureID), gfxSampler: this.sceneDepthSampler, lateBinding: undefined });
+                    this.renderInstListWater.drawOnPassRenderer(this.renderHelper.renderCache, passRenderer);
+                });
+            });
+        }
+
         this.renderHelper.debugDraw.pushPasses(builder, mainColorTargetID, mainDepthTargetID);
-        this.renderHelper.debugThumbnails.pushPasses(builder, renderInstManager, mainColorTargetID, viewerInput.mouseLocation);
-        this.renderHelper.antialiasingSupport.pushPasses(builder, viewerInput, mainColorTargetID);
-        builder.resolveRenderTargetToExternalTexture(mainColorTargetID, viewerInput.onscreenTexture);
+
+        const ldrColorTargetID = this.post_process.render(globals, builder, this.renderHelper, viewerInput, mainColorTargetID);
+
+        this.renderHelper.debugThumbnails.pushPasses(builder, renderInstManager, ldrColorTargetID, viewerInput.mouseLocation);
+        this.renderHelper.antialiasingSupport.pushPasses(builder, viewerInput, ldrColorTargetID);
+        builder.resolveRenderTargetToExternalTexture(ldrColorTargetID, viewerInput.onscreenTexture);
 
         this.prepareToRender(device, viewerInput);
         builder.execute();
         this.renderInstListMain.reset();
+        this.renderInstListWater.reset();
     }
 
     public destroy(device: GfxDevice): void {
@@ -1142,3 +1250,4 @@ export class TheWitnessRenderer implements SceneGfx {
         this.globals.destroy(device);
     }
 }
+
