@@ -555,6 +555,9 @@ class GfxImplP_GL implements GfxSwapChain, GfxDevice {
         this._EXT_texture_filter_anisotropic = gl.getExtension('EXT_texture_filter_anisotropic');
         this._EXT_texture_norm16 = gl.getExtension('EXT_texture_norm16');
         this._KHR_parallel_shader_compile = gl.getExtension('KHR_parallel_shader_compile');
+        // Float colour targets aren't renderable in WebGL2 without this; asking for it costs
+        // nothing where it isn't used, and a scene that renders in HDR can't work without it.
+        gl.getExtension('EXT_color_buffer_float');
         this._OES_texture_float_linear = gl.getExtension('OES_texture_float_linear');
         this._OES_texture_half_float_linear = gl.getExtension('OES_texture_half_float_linear');
         this._OES_draw_buffers_indexed = gl.getExtension('OES_draw_buffers_indexed');
