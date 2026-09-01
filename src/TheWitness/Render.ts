@@ -1059,7 +1059,7 @@ export class TheWitnessRenderer implements SceneGfx {
         // Work in The Witness's own space, where Z is up: lift the camera from the marker on the
         // ground to about eye height, and take the direction it faces with the vertical dropped,
         // which is what leaves the horizon level.
-        vec3.set(scratchVec3a, start.position[0], start.position[1], start.position[2] + 1.69);
+        vec3.set(scratchVec3a, start.position[0], start.position[1], start.position[2] + 1.2);
         vec3.transformQuat(scratchVec3b, Vec3UnitY, start.orientation);
         scratchVec3b[2] = 0.0;
         if (vec3.squaredLength(scratchVec3b) < 0.0001)
@@ -1118,6 +1118,19 @@ export class TheWitnessRenderer implements SceneGfx {
 
         globals.occlusion_manager.prepareToRender(globals, this.renderHelper.renderInstManager);
 
+        // Building an asset costs about a millisecond, and a world holds far more of them than a
+        // frame can afford, so the budget has to go somewhere. It goes to whatever covers the
+        // most of the screen: entities offer up how much of it they stand to fill, and anything
+        // under the floor waits. The floor rises while more is waiting than can be built and
+        // falls once the view has caught up, which keeps it tracking the camera by itself.
+        if (globals.asset_loads_remaining <= 0)
+            globals.asset_load_priority_floor = Math.max(globals.asset_load_priority_floor, 1e-7) * 1.5;
+        else if (globals.asset_loads_deferred === 0)
+            globals.asset_load_priority_floor = 0.0;
+        else
+            globals.asset_load_priority_floor *= 0.6;
+
+        globals.asset_loads_deferred = 0;
         globals.asset_loads_remaining = ASSET_LOADS_PER_FRAME;
 
         // Entities outside the cluster system -- the water among them -- come first. There are
@@ -1137,10 +1150,19 @@ export class TheWitnessRenderer implements SceneGfx {
             if (!viewpoint.frustum.containsSphere(cluster.bounding_center_world, cluster.bounding_radius_world))
                 continue;
 
-            // Brings in the cluster's package, which its elements load their assets out of.
-            cluster.ensure_assets_loaded(globals);
-            if (!cluster.assets_are_loaded())
-                continue;
+            // Brings in the cluster's package, which its elements load their assets out of. It
+            // waits its turn by the same measure as everything else.
+            if (!cluster.assets_are_loaded()) {
+                const squared_distance = vec3.squaredDistance(viewpoint.cameraPos, cluster.bounding_center_world);
+                if (cluster.asset_load_priority(squared_distance) < globals.asset_load_priority_floor) {
+                    globals.asset_loads_deferred++;
+                    continue;
+                }
+
+                cluster.ensure_assets_loaded(globals);
+                if (!cluster.assets_are_loaded())
+                    continue;
+            }
 
             for (let j = 0; j < cluster.elements.length; j++) {
                 const entity = globals.entity_manager.entity_list[cluster.elements[j]];

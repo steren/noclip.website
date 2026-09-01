@@ -175,6 +175,13 @@ export class Entity implements Portable {
     // all of them at once are far more than a renderer process can hold -- creating them up
     // front runs it out of memory. Each entity's assets are created the first time it is about
     // to be drawn instead, which keeps only what the camera has seen resident.
+    // Roughly how much of the screen this entity stands to cover: the nearer and the larger it
+    // is, the sooner it deserves to be built. The world holds far more than a frame can afford,
+    // so this is what decides the order things appear in.
+    public asset_load_priority(squared_distance: number): number {
+        return (this.bounding_radius_world * this.bounding_radius_world) / Math.max(squared_distance, 0.01);
+    }
+
     public assets_are_loaded(): boolean {
         return this.assets_loaded;
     }
@@ -279,6 +286,11 @@ export class Entity implements Portable {
             // of zero means the entity never said how big it is, so let those through.
             if (this.bounding_radius_world > 0.0 && !globals.viewpoint.frustum.containsSphere(this.bounding_center_world, this.bounding_radius_world))
                 return;
+
+            if (this.asset_load_priority(squared_distance) < globals.asset_load_priority_floor) {
+                globals.asset_loads_deferred++;
+                return;
+            }
 
             this.ensure_assets_loaded(globals);
 

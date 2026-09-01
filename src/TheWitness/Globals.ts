@@ -124,6 +124,10 @@ export class TheWitnessGlobals {
     public scene_time = 0.0;
     // How many more entities may create their assets this frame; see Entity.ensure_assets_loaded.
     public asset_loads_remaining = 0;
+    // Entities below this much of the screen don't get to load yet, so the budget goes to what
+    // fills the view. It moves with how much is waiting; see TheWitnessRenderer.prepareToRender.
+    public asset_load_priority_floor = 0.0;
+    public asset_loads_deferred = 0;
     // Water is drawn in a pass of its own, after the scene it looks through; see Render.ts.
     public water_render_inst_list: GfxRenderInstList | null = null;
 
