@@ -740,6 +740,7 @@ const ASSET_LOADS_PER_FRAME = 64;
 const scratchVec3a = vec3.create();
 const scratchVec3b = vec3.create();
 const scratchMatrix = mat4.create();
+const KEY_LIGHT_STRENGTH = 8.0;
 class Device_Material {
     public visible: boolean = true;
 
@@ -1097,7 +1098,10 @@ export class TheWitnessRenderer implements SceneGfx {
         vec3.set(scratchVec3a, misc.sun_x as number, misc.sun_y as number, misc.sun_z as number);
         vec3.normalize(scratchVec3a, scratchVec3a);
         offs += fillVec3v(d, offs, scratchVec3a, misc.wind_y as number);
-        offs += fillVec4(d, offs, 32, 32, 32, globals.scene_time);
+        // The game shadow-maps its sun; this doesn't, so a directional term at full strength
+        // lands on faces the sun can't reach and flattens the bake underneath it. Turned down,
+        // it still lifts the chunks whose lightmaps are dark without washing out the rest.
+        offs += fillVec4(d, offs, KEY_LIGHT_STRENGTH, KEY_LIGHT_STRENGTH, KEY_LIGHT_STRENGTH, globals.scene_time);
 
         const render_sky = globals.sky_variables['render/sky'];
         offs += fillVec4(d, offs, render_sky.fog_color_x as number, render_sky.fog_color_y as number, render_sky.fog_color_z as number, render_sky.fog_sky_blend as number);

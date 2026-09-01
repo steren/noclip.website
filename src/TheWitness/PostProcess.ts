@@ -65,14 +65,20 @@ layout(std140) uniform ub_Params {
 
 #define u_Threshold     (u_Params.x)
 #define u_KeyValue      (u_Params.y)
-#define u_MinLuminance  (u_Params.z)
-#define u_MaxLuminance  (u_Params.w)
+#define u_MinExposure   (u_Params.z)
+#define u_MaxExposure   (u_Params.w)
 
 void main() {
     // The same exposure the composite will apply, so the threshold means the same thing in both.
-    float t_AverageLuminance = clamp(exp(texture(SAMPLER_2D(u_Luminance), vec2(0.5)).r), u_MinLuminance, u_MaxLuminance);
-    vec3 t_Color = texture(SAMPLER_2D(u_Texture), v_TexCoord).rgb * (u_KeyValue / t_AverageLuminance);
-    gl_FragColor = vec4(max(t_Color - u_Threshold, vec3(0.0)), 1.0);
+    float t_AverageLuminance = exp(texture(SAMPLER_2D(u_Luminance), vec2(0.5)).r);
+    float t_Exposure = clamp(u_KeyValue / max(t_AverageLuminance, 0.0001), u_MinExposure, u_MaxExposure) * 2.5;
+    vec3 t_Color = texture(SAMPLER_2D(u_Texture), v_TexCoord).rgb * t_Exposure;
+
+    // How far past the threshold the pixel is, measured on brightness rather than per channel:
+    // thresholding each channel on its own makes a saturated colour glow for being red, not for
+    // being bright, which is what turned the blossom trees into lamps.
+    float t_Luma = dot(t_Color, vec3(0.2126, 0.7152, 0.0722));
+    gl_FragColor = vec4(t_Color * (max(t_Luma - u_Threshold, 0.0) / max(t_Luma, 0.0001)), 1.0);
 }
 `;
 }
@@ -119,11 +125,17 @@ layout(std140) uniform ub_Params {
 };
 
 #define u_KeyValue      (u_Params0.x)
-#define u_MinLuminance  (u_Params0.y)
-#define u_MaxLuminance  (u_Params0.z)
+#define u_MinExposure   (u_Params0.y)
+#define u_MaxExposure   (u_Params0.z)
 #define u_BloomWeight   (u_Params0.w)
 #define u_Vignetting    (u_Params1.x)
 #define u_BloomEnabled  (u_Params1.y)
+
+// The curve and the key value come from the game, but the exposure it finally settles on does
+// not: the game measures its scene in units this one doesn't share, and metering a frame that is
+// half bright sky drags the land into the dark. This bias is the one number here chosen by eye,
+// against the game's own screenshots.
+#define EXPOSURE_BIAS (2.5)
 
 float Uncharted2Tonemap(float x) {
     float A = 0.15, B = 0.5, C = 0.1, D = 0.1, E = 0.02, F = 0.6;
@@ -133,10 +145,13 @@ float Uncharted2Tonemap(float x) {
 void main() {
     vec3 t_Color = texture(SAMPLER_2D(u_Texture), v_TexCoord).rgb;
 
-    // The frame's own brightness sets the exposure, the way the game's auto-exposure does:
-    // key value over the geometric mean of the luminance, held between its two limits.
-    float t_AverageLuminance = clamp(exp(texture(SAMPLER_2D(u_Luminance), vec2(0.5)).r), u_MinLuminance, u_MaxLuminance);
-    float t_Exposure = u_KeyValue / t_AverageLuminance;
+    // The frame's own brightness sets the exposure, the way the game's auto-exposure does: the
+    // key value over the geometric mean of the luminance, so the average lands on middle grey.
+    // The limits bound the exposure rather than the average -- they are stated in the game's
+    // units, and this scene's are not the same, so clamping the average pinned every frame to
+    // the same value and flattened the picture.
+    float t_AverageLuminance = exp(texture(SAMPLER_2D(u_Luminance), vec2(0.5)).r);
+    float t_Exposure = clamp(u_KeyValue / max(t_AverageLuminance, 0.0001), u_MinExposure, u_MaxExposure) * EXPOSURE_BIAS;
     t_Color *= t_Exposure;
 
     if (u_BloomEnabled > 0.0)
@@ -198,8 +213,11 @@ export class Post_Process {
         const tone_mapping = globals.all_variables['render/tone_mapping'];
         const bloom = globals.all_variables['render/bloom'];
         const key_value = tone_mapping !== undefined ? tone_mapping.key_value as number : 0.22;
-        const min_luminance = tone_mapping !== undefined ? tone_mapping.min_luminance as number : 0.1;
-        const max_luminance = tone_mapping !== undefined ? tone_mapping.max_luminance as number : 1.0;
+        // The game's min/max luminance bound how far its auto-exposure may go, in its own units.
+        // Ours differ, so these bound the exposure itself: wide enough to let the key value do
+        // the work, tight enough that an almost-black or blown-out frame can't run away.
+        const min_exposure = 0.002;
+        const max_exposure = 8.0;
         const vignetting = tone_mapping !== undefined ? tone_mapping.vignetting as number : 0.8;
         const bloom_enabled = bloom !== undefined ? bloom.enable_bloom !== false : true;
         const bloom_threshold = bloom !== undefined ? bloom.bloom_threshold as number : 10.0;
@@ -253,7 +271,7 @@ export class Post_Process {
             brightInst.setGfxProgram(cache.createProgram(this.brightPassProgram));
             {
                 const offs = brightInst.allocateUniformBuffer(0, 4);
-                fillVec4(brightInst.mapUniformBufferF32(0), offs, bloom_threshold, key_value, min_luminance, max_luminance);
+                fillVec4(brightInst.mapUniformBufferF32(0), offs, bloom_threshold, key_value, min_exposure, max_exposure);
             }
 
             builder.pushPass((pass) => {
@@ -305,7 +323,7 @@ export class Post_Process {
         {
             let offs = compositeInst.allocateUniformBuffer(0, 8);
             const d = compositeInst.mapUniformBufferF32(0);
-            offs += fillVec4(d, offs, key_value, min_luminance, max_luminance, bloom_weight);
+            offs += fillVec4(d, offs, key_value, min_exposure, max_exposure, bloom_weight);
             offs += fillVec4(d, offs, vignetting, bloomTargetID !== null ? 1 : 0, 0, 0);
         }
 
