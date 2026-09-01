@@ -286,7 +286,16 @@ export class Entity implements Portable {
                 return;
         }
 
-        this.mesh_lod = (globals.render_settings.lod_distance_enabled && squared_distance >= this.lod_distance_squared) ? 1 : 0;
+        // A mesh can carry up to seven levels of detail -- the lake tiles that make up the sea
+        // do -- and picking only between the first two leaves the coarse ones unused, drawing
+        // the whole ocean at its finest. Each step out covers twice the distance of the one
+        // before it, and the mesh's own count says how far the chain goes.
+        this.mesh_lod = 0;
+        if (globals.render_settings.lod_distance_enabled && squared_distance >= this.lod_distance_squared) {
+            const max_lod_count = this.mesh_instance !== null ? this.mesh_instance.mesh_asset.max_lod_count : 1;
+            const steps = 1 + Math.floor(0.5 * Math.log2(squared_distance / this.lod_distance_squared));
+            this.mesh_lod = Math.min(steps, max_lod_count - 1);
+        }
 
         const depth = computeViewSpaceDepthFromWorldSpacePoint(globals.viewpoint.viewFromWorldMatrix, this.bounding_center_world);
         this.mesh_instance.prepareToRender(globals, renderInstManager, this, depth);
