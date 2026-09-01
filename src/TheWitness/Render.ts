@@ -506,20 +506,34 @@ void mainPS() {
 
     bool t_HasIncomingLight = false;
 
-    // Add directional light.
-    CalcLight(t_HasIncomingLight, t_DiffuseLight, u_KeyLightDir.xyz, u_KeyLightColor.rgb, t_NormalWorld.xyz, t_WorldDirectionToEye.xyz);
-
     bool use_lightmap = ${this.is_flag(m, Material_Flags.Lightmapped)};
+
+    // How much of the sky this surface can see, as the bake understands it. The game shadow-maps
+    // its sun; without that, a directional light reaches everywhere -- through a hillside and
+    // into a cave, which came out as brightly lit as the shore. The baked lighting already knows
+    // what is buried and what is open, so it stands in for the shadow: dark bakes take little
+    // sun, open ones take it all. The floor keeps surfaces whose lightmap is missing or has yet
+    // to stream in from going black.
+    float t_SunVisibility = 1.0;
+
+    vec3 t_LightMapSample = vec3(0.0);
     if (use_lightmap) {
         bool use_vertex_lightmap = ${this.is_flag(m, Material_Flags.Vertex_Lightmap | Material_Flags.Vertex_Lightmap_Auto)};
 
-        vec3 t_LightMapSample;
         if (use_vertex_lightmap) {
             t_LightMapSample = v_LightMapData.xyz;
         } else {
             t_LightMapSample = CalcLightMapColor(v_LightMapData.xy);
         }
 
+        float t_BakedBrightness = dot(t_LightMapSample * u_LightMapScale.rgb, vec3(0.2126, 0.7152, 0.0722));
+        t_SunVisibility = clamp(t_BakedBrightness * 0.35, 0.15, 1.0);
+    }
+
+    // Add directional light.
+    CalcLight(t_HasIncomingLight, t_DiffuseLight, u_KeyLightDir.xyz, u_KeyLightColor.rgb * t_SunVisibility, t_NormalWorld.xyz, t_WorldDirectionToEye.xyz);
+
+    if (use_lightmap) {
         bool use_vegetation = ${this.is_type(m, Material_Type.Vegetation)};
         if (use_vegetation) {
             // Kill some of the existing light.
