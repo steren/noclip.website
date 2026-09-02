@@ -381,7 +381,15 @@ void CalcLight(inout bool t_HasLighting, inout vec3 t_Diffuse, vec3 t_LightDirWo
 }
 
 vec4 TintTexture(in vec4 t_Sample, in vec3 t_TintColor, in vec3 t_AverageColor, in float t_TintAmount) {
-    vec3 t_TintedColor = t_TintColor.rgb * (t_Sample.rgb / t_AverageColor.rgb);
+    // A material that asks for no tint must come back untouched. It did not: the divide below
+    // runs first, and a material with no texture in a slot gets an average colour of zero, so
+    // the result was inf -- and mix(x, inf, 0.0) is inf * 0.0, which is NaN, not x. A NaN colour
+    // then poisons the whole primitive through the blend, transparent texels included, which is
+    // what turned the keep's rust stains into black slabs across its gateway.
+    if (t_TintAmount <= 0.0)
+        return t_Sample;
+
+    vec3 t_TintedColor = t_TintColor.rgb * (t_Sample.rgb / max(t_AverageColor.rgb, vec3(1e-6)));
     t_Sample.rgb = mix(t_Sample.rgb, t_TintedColor.rgb, t_TintAmount);
     return t_Sample;
 }
