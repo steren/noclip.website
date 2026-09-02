@@ -822,6 +822,20 @@ export class Asset_Manager {
         }
     }
 
+    // The decoded bytes of an asset, without building it. The shadow map is a height field the
+    // CPU has to sweep before the GPU can use it, and Texture_Asset keeps nothing back once it
+    // has uploaded.
+    public load_asset_bytes(type: Asset_Type, source_name: string): ArrayBufferSlice | null {
+        const data = this.load_asset_data(get_processed_filename(type, source_name, 0));
+        if (data === null)
+            return null;
+
+        const header = data.createDataView();
+        const format: Asset_Format = header.getUint8(0x04);
+        const body = data.slice(0x0C);
+        return format === Asset_Format.LZ4 ? LZ4.decompress(body, header.getUint32(0x08, true)) : body;
+    }
+
     private load_asset_data(processed_filename: string): ArrayBufferSlice | null {
         const entry = this.entry_cache.get(processed_filename);
         if (entry === undefined)

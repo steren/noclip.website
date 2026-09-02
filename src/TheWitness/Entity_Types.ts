@@ -3,7 +3,7 @@ import { vec3 } from "gl-matrix";
 import { Stream, Stream_read_Vector3, Stream_read_Array_int, Stream_read_Color, Stream_read_Quaternion, Stream_read_Vector2, Stream_read_Array_float } from "./Stream.js";
 import ArrayBufferSlice from "../ArrayBufferSlice.js";
 import { assert, nullify, setAssertLogStacks } from "../util.js";
-import { Entity, Portable, Lightmap_Table, Entity_Pattern_Point, Entity_Inanimate, Entity_Power_Cable, Entity_Cluster, Entity_Group, Entity_Lake } from "./Entity.js";
+import { Entity, Portable, Lightmap_Table, Entity_Pattern_Point, Entity_Inanimate, Entity_Power_Cable, Entity_Cluster, Entity_Group, Entity_Lake, Entity_World } from "./Entity.js";
 
 function get_truth_value(portable: Portable, item: Metadata_Item): boolean {
     const v: any = portable[item.name];
@@ -2023,6 +2023,10 @@ class Entity_Type_World extends Portable_Type {
         m.add_float('world_z_min', { flags: Metadata_Item_Flags.ADJUSTABLE_WITHOUT_RECREATE });
         m.add_float('world_z_max', { flags: Metadata_Item_Flags.ADJUSTABLE_WITHOUT_RECREATE });
         m.add_integer('shadow_render_count', { minimum_revision_number: 0x6f, flags: Metadata_Item_Flags.DO_NOT_DISPLAY_IN_UI });
+    }
+
+    public override construct_new_obj(portable_id: number, revision_number: number): Entity {
+        return new Entity_World(portable_id, revision_number);
     }
 }
 

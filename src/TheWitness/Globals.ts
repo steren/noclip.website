@@ -1,5 +1,6 @@
 
 import { Entity_Manager, Entity_Render_List } from "./Entity.js";
+import { Shadow_Map } from "./Shadow_Map.js";
 import { Asset_Manager, Asset_Type } from "./Assets.js";
 import { GfxClipSpaceNearZ, GfxDevice } from "../gfx/platform/GfxPlatform.js";
 import { mat4, vec3 } from "gl-matrix";
@@ -118,6 +119,7 @@ export class TheWitnessGlobals {
     public debug_draw: DebugDraw;
     public all_variables: Variables;
     public sky_variables: Variables;
+    public shadow_map: Shadow_Map | null = null;
     public occlusion_manager: Occlusion_Manager;
     public device_material_cache: Device_Material_Cache;
     public render_settings = new Render_Settings();

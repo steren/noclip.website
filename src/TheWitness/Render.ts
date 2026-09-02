@@ -94,11 +94,18 @@ layout(std140) uniform ub_SceneParams {
     // xyz: what the sky says the baked light is worth (lightmap_color * lightmap_brightness).
     // w: the sky's own brightness.
     vec4 u_LightMapScale;
+    // xy: the world point the shadow map's first texel stands over, z: 1 / the world size it
+    // covers, w: the height its zero reads as.
+    vec4 u_ShadowMapParams;
+    // x: the height range its full scale spans, y: 1 once the map is there, z: depth bias,
+    // w: the height range the shadow edge is softened over.
+    vec4 u_ShadowMapDecode;
 };
 
 #define u_WindDirection (vec3(u_CameraPosWorld.w, u_KeyLightDir.w, 0.0))
 #define u_SceneTime (u_KeyLightColor.w)
 #define u_SkyBrightness (u_LightMapScale.w)
+#define u_ShadowMapEnabled (u_ShadowMapDecode.y)
 
 layout(std140) uniform ub_ObjectParams {
     Mat3x4 u_ModelMatrix;
@@ -134,6 +141,9 @@ uniform sampler2D u_LightMap0;
 uniform sampler2D u_LightMap1;
 
 uniform sampler2D u_TerrainColor;
+
+// The height at which the sun arrives, over every column of the world; see Shadow_Map.
+uniform sampler2D u_ShadowMap;
 
 // The scene as it stood before the water was drawn over it; see the 'Water' pass.
 uniform sampler2D u_SceneColor;
@@ -508,13 +518,17 @@ void mainPS() {
 
     bool use_lightmap = ${this.is_flag(m, Material_Flags.Lightmapped)};
 
-    // How much of the sky this surface can see, as the bake understands it. The game shadow-maps
-    // its sun; without that, a directional light reaches everywhere -- through a hillside and
-    // into a cave, which came out as brightly lit as the shore. The baked lighting already knows
-    // what is buried and what is open, so it stands in for the shadow: dark bakes take little
-    // sun, open ones take it all. The floor keeps surfaces whose lightmap is missing or has yet
-    // to stream in from going black.
+    // Whether the sun reaches this surface at all. The world ships a height field of itself,
+    // swept along the sun into the height at which its light arrives, so the question is just
+    // whether this point stands above that height -- which works for geometry that is nowhere
+    // near here, and for geometry that has yet to stream in.
     float t_SunVisibility = 1.0;
+    if (u_ShadowMapEnabled > 0.0) {
+        vec2 t_ShadowCoord = (u_ShadowMapParams.xy - v_PositionWorld.yx) * u_ShadowMapParams.z;
+        float t_SunReachesHeight = u_ShadowMapParams.w - texture(SAMPLER_2D(u_ShadowMap), t_ShadowCoord).r * u_ShadowMapDecode.x;
+        float t_AboveShadow = v_PositionWorld.z - t_SunReachesHeight + u_ShadowMapDecode.z;
+        t_SunVisibility = smoothstep(0.0, u_ShadowMapDecode.w, t_AboveShadow);
+    }
 
     vec3 t_LightMapSample = vec3(0.0);
     if (use_lightmap) {
@@ -526,8 +540,12 @@ void mainPS() {
             t_LightMapSample = CalcLightMapColor(v_LightMapData.xy);
         }
 
-        float t_BakedBrightness = dot(t_LightMapSample * u_LightMapScale.rgb, vec3(0.2126, 0.7152, 0.0722));
-        t_SunVisibility = clamp(t_BakedBrightness * 0.35, 0.15, 1.0);
+        // Without the map, the bake stands in for it: it already knows what is buried and what
+        // is open, so dark bakes take little sun and open ones take it all.
+        if (u_ShadowMapEnabled == 0.0) {
+            float t_BakedBrightness = dot(t_LightMapSample * u_LightMapScale.rgb, vec3(0.2126, 0.7152, 0.0722));
+            t_SunVisibility = clamp(t_BakedBrightness * 0.35, 0.15, 1.0);
+        }
     }
 
     // Add directional light.
@@ -754,14 +772,14 @@ const ASSET_LOADS_PER_FRAME = 64;
 const scratchVec3a = vec3.create();
 const scratchVec3b = vec3.create();
 const scratchMatrix = mat4.create();
-const KEY_LIGHT_STRENGTH = 8.0;
+const KEY_LIGHT_STRENGTH = 12.0;
 class Device_Material {
     public visible: boolean = true;
 
     private shader_instance: TheWitnessShaderInstance;
     private gfx_program: GfxProgram;
     private texture_map: (Texture_Asset | null)[] = nArray(3, () => null);
-    private texture_mapping_array: TextureMapping[] = nArray(12, () => new TextureMapping());
+    private texture_mapping_array: TextureMapping[] = nArray(13, () => new TextureMapping());
     public is_water: boolean = false;
 
     public sortKeyBase = 0;
@@ -808,6 +826,11 @@ class Device_Material {
         this.load_texture(globals, 9, 'white', clamp_sampler);
         this.load_texture(globals, 10, 'white', clamp_sampler);
 
+        if (globals.shadow_map !== null && globals.shadow_map.enabled)
+            this.texture_mapping_array[12].copy(globals.shadow_map.texture_mapping);
+        else
+            this.load_texture(globals, 12, 'white', clamp_sampler);
+
         this.shader_instance = globals.device_material_cache.create_shader_instance(this.render_material);
         this.gfx_program = this.shader_instance.getGfxProgram(globals.renderCache);
 
@@ -815,8 +838,8 @@ class Device_Material {
         this.is_water = material_type === Material_Type.Lake;
         if (this.is_water) {
             this.texture_mapping_array.push(new TextureMapping(), new TextureMapping());
-            this.texture_mapping_array[12].lateBinding = 'scene-color';
-            this.texture_mapping_array[13].lateBinding = 'scene-depth';
+            this.texture_mapping_array[13].lateBinding = 'scene-color';
+            this.texture_mapping_array[14].lateBinding = 'scene-depth';
         }
 
         // Disable invisible material types.
@@ -972,7 +995,7 @@ export class Mesh_Instance {
 // The scene depth the water reads is a depth texture, and the platform checks that the shader
 // says so; everything else here is an ordinary colour map.
 const samplerEntries: GfxBindingLayoutSamplerDescriptor[] = nArray(16, () => ({ dimension: GfxTextureDimension.n2D, formatKind: GfxSamplerFormatKind.Float }));
-samplerEntries[13] = { dimension: GfxTextureDimension.n2D, formatKind: GfxSamplerFormatKind.Depth, comparison: false };
+samplerEntries[14] = { dimension: GfxTextureDimension.n2D, formatKind: GfxSamplerFormatKind.Depth, comparison: false };
 
 const bindingLayouts: GfxBindingLayoutDescriptor[] = [
     { numUniformBuffers: 2, numSamplers: 16, samplerEntries, },
@@ -1001,32 +1024,12 @@ class Skydome {
     }
 }
 
-export class Cached_Shadow_Map {
-    public texture_mapping = nArray(1, () => new TextureMapping());
-    private shadow_map_size = 8192;
-
-    constructor(globals: TheWitnessGlobals, world: Entity_World) {
-        const texture_name = `${globals.entity_manager.universe_name}_shadow_map_${this.shadow_map_size}`;
-
-        const clamp_sampler = globals.renderCache.createSampler({
-            minFilter: GfxTexFilterMode.Bilinear,
-            magFilter: GfxTexFilterMode.Bilinear,
-            mipFilter: GfxMipFilterMode.Linear,
-            wrapS: GfxWrapMode.Clamp,
-            wrapT: GfxWrapMode.Clamp,
-        });
-
-        load_texture(globals, this.texture_mapping[0], texture_name, clamp_sampler);
-    }
-}
-
 export class TheWitnessRenderer implements SceneGfx {
     public renderHelper: GfxRenderHelper;
     private renderInstListMain = new GfxRenderInstList();
     private renderInstListWater = new GfxRenderInstList();
 
     private skydome: Skydome;
-    private cached_shadow_map: Cached_Shadow_Map | null = null;
 
     private post_process: Post_Process;
     private sceneColorSampler: GfxSampler;
@@ -1049,9 +1052,6 @@ export class TheWitnessRenderer implements SceneGfx {
             wrapT: GfxWrapMode.Clamp,
         });
         this.skydome = new Skydome(globals);
-
-        const world = this.globals.entity_manager.flat_entity_list.find((e) => e instanceof Entity_World) as Entity_World;
-        // this.cached_shadow_map = new Cached_Shadow_Map(globals, world);
 
         globals.debug_draw = this.renderHelper.debugDraw;
         globals.water_render_inst_list = this.renderInstListWater;
@@ -1102,7 +1102,7 @@ export class TheWitnessRenderer implements SceneGfx {
         viewpoint.setupFromCamera(viewerInput.camera);
         this.renderHelper.debugDraw.beginFrame(viewpoint.clipFromViewMatrix, viewpoint.viewFromWorldMatrix, viewerInput.backbufferWidth, viewerInput.backbufferHeight);
 
-        let offs = template.allocateUniformBuffer(TheWitnessShaderTemplate.ub_SceneParams, 64);
+        let offs = template.allocateUniformBuffer(TheWitnessShaderTemplate.ub_SceneParams, 72);
         const d = template.mapUniformBufferF32(TheWitnessShaderTemplate.ub_SceneParams);
         offs += fillMatrix4x4(d, offs, viewpoint.clipFromWorldMatrix);
         mat4.invert(scratchMatrix, viewpoint.clipFromWorldMatrix);
@@ -1112,9 +1112,10 @@ export class TheWitnessRenderer implements SceneGfx {
         vec3.set(scratchVec3a, misc.sun_x as number, misc.sun_y as number, misc.sun_z as number);
         vec3.normalize(scratchVec3a, scratchVec3a);
         offs += fillVec3v(d, offs, scratchVec3a, misc.wind_y as number);
-        // The game shadow-maps its sun; this doesn't, so a directional term at full strength
-        // lands on faces the sun can't reach and flattens the bake underneath it. Turned down,
-        // it still lifts the chunks whose lightmaps are dark without washing out the rest.
+        // The bakes in this build carry the sky and the bounce, not the sun, so the directional
+        // term is what separates a lit face from a shaded one. It could only be kept low while
+        // it reached everywhere; now that Shadow_Map holds it off what the sun cannot see, it
+        // can be turned up far enough to read as sunlight without washing the stone out.
         offs += fillVec4(d, offs, KEY_LIGHT_STRENGTH, KEY_LIGHT_STRENGTH, KEY_LIGHT_STRENGTH, globals.scene_time);
 
         const render_sky = globals.sky_variables['render/sky'];
@@ -1129,6 +1130,15 @@ export class TheWitnessRenderer implements SceneGfx {
             (render_sky.lightmap_color_y as number) * lightmap_brightness,
             (render_sky.lightmap_color_z as number) * lightmap_brightness,
             render_sky.brightness as number);
+
+        const shadow_map = globals.shadow_map;
+        if (shadow_map !== null && shadow_map.enabled) {
+            offs += fillVec4(d, offs, shadow_map.world_origin[0], shadow_map.world_origin[1], shadow_map.inv_world_size, shadow_map.z_max);
+            offs += fillVec4(d, offs, shadow_map.z_range, 1.0, shadow_map.depth_bias, shadow_map.penumbra);
+        } else {
+            offs += fillVec4(d, offs, 0.0, 0.0, 0.0, 0.0);
+            offs += fillVec4(d, offs, 1.0, 0.0, 0.0, 1.0);
+        }
 
         globals.occlusion_manager.prepareToRender(globals, this.renderHelper.renderInstManager);
 
@@ -1202,36 +1212,6 @@ export class TheWitnessRenderer implements SceneGfx {
         const builder = this.renderHelper.renderGraph.newGraphBuilder();
 
         globals.occlusion_manager.pushPasses(globals, builder, renderInstManager);
-
-        if (this.cached_shadow_map !== null) {
-            const shadowDepthDesc = new GfxrRenderTargetDescription(GfxFormat.D24);
-            shadowDepthDesc.setDimensions(1024, 1024, 1);
-
-            const shadowDepthTargetID = builder.createRenderTargetID(shadowDepthDesc, 'Main Depth');
-            builder.pushPass((pass) => {
-                pass.setDebugName('Cached Shadow Map');
-                pass.attachRenderTargetID(GfxrAttachmentSlot.DepthStencil, shadowDepthTargetID);
-
-                const renderHelper = this.renderHelper;
-                const renderInst = renderHelper.renderInstManager.newRenderInst();
-                renderInst.setUniformBuffer(renderHelper.uniformBuffer);
-                renderInst.setAllowSkippingIfPipelineNotReady(false);
-
-                renderInst.setMegaStateFlags(fullscreenMegaState);
-                renderInst.setBindingLayouts([{ numUniformBuffers: 0, numSamplers: 1 }]);
-                renderInst.setDrawCount(3);
-
-                const copyProgram = new DepthCopyProgram();
-                const gfxProgram = renderHelper.renderCache.createProgram(copyProgram);
-
-                renderInst.setGfxProgram(gfxProgram);
-
-                pass.exec((passRenderer) => {
-                    renderInst.setSamplerBindingsFromTextureMappings(this.cached_shadow_map!.texture_mapping);
-                    renderInst.drawOnPass(renderHelper.renderCache, passRenderer);
-                });
-            });
-        }
 
         // The scene is rendered in float, so the sun and sky keep their range until tone mapping.
         const mainColorDesc = makeBackbufferDescSimple(GfxrAttachmentSlot.Color0, viewerInput, standardFullClearRenderPassDescriptor);
