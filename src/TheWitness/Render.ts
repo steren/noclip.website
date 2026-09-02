@@ -562,7 +562,13 @@ void mainPS() {
         }
 
         t_DiffuseLight += t_LightMapSample * u_LightMapScale.rgb;
-        t_HasIncomingLight = true;
+        // Only count the bake as light if a page is really bound. A material can be marked
+        // lightmapped and have none -- the puzzle panels are, because the game draws and lights
+        // those itself -- and Translucent takes no directional light either, so calling it lit
+        // leaves the surface with nothing at all and paints it black. That is the grid on the
+        // entry yard floor. Falling through to the unlit default below at least shows it.
+        if (u_LightMap0Blend > 0.0 || u_LightMap1Blend > 0.0)
+            t_HasIncomingLight = true;
     }
 
     if (!t_HasIncomingLight)
@@ -850,8 +856,11 @@ class Device_Material {
             this.texture_mapping_array[14].lateBinding = 'scene-depth';
         }
 
-        // Disable invisible material types.
-        if (material_type === Material_Type.Collision_Only || material_type === Material_Type.Occluder)
+        // Disable invisible material types. Shadow_Only is the blob-shadow geometry the game
+        // parks under trees and in doorways -- obj_primitives_shadowPlane and friends. It exists
+        // to darken the bake, never to be looked at, and drawing it puts a flat black quad on the
+        // ground at the foot of every mangrove.
+        if (material_type === Material_Type.Collision_Only || material_type === Material_Type.Occluder || material_type === Material_Type.Shadow_Only)
             this.visible = false;
 
         // This should go in the foam decal pass only...
