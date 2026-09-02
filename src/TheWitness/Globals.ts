@@ -140,6 +140,19 @@ export class TheWitnessGlobals {
 
         this.all_variables = parse_variables(this.asset_manager.load_asset(Asset_Type.Raw, `All.variables`)!);
         this.sky_variables = parse_variables(this.asset_manager.load_asset(Asset_Type.Raw, `sky.variables`)!);
+
+        // Bloom and tone mapping are not in All.variables; they ship as files of their own, and
+        // they declare the very categories the post process asks for -- render/bloom and
+        // render/tone_mapping. Not loading them left it falling back on constants that had been
+        // copied out of these same files by hand, and on invented exposure limits in place of
+        // the luminance band they state.
+        for (const name of [`bloom.variables`, `tone_mapping.variables`]) {
+            const contents = this.asset_manager.load_asset(Asset_Type.Raw, name);
+            if (contents === null)
+                continue;
+            for (const [category, values] of Object.entries(parse_variables(contents)))
+                this.all_variables[category] = Object.assign(this.all_variables[category] ?? {}, values);
+        }
     }
 
     public destroy(device: GfxDevice): void {
