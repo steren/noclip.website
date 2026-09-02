@@ -589,7 +589,10 @@ void mainPS() {
     vec3 t_FinalColor = vec3(0.0);
     t_FinalColor.rgb += t_DiffuseLight.rgb * t_Albedo.rgb;
 
-    bool use_lake = ${this.is_type(m, Material_Type.Lake)};
+    // Lake is the sea and the big open water; Pool is the small still water -- the cave
+    // pools, the cisterns. They are the same material to look at, and a Pool left out of
+    // this branch has no albedo and no lightmap to fall back on, so it came out black.
+    bool use_lake = ${this.is_type(m, Material_Type.Lake) || this.is_type(m, Material_Type.Pool)};
     if (use_lake) {
         // What the scene looked like where this pixel is, before the water went over it. The
         // fragment coordinate indexes the framebuffer directly, so it needs no flipping.
@@ -629,7 +632,12 @@ void mainPS() {
         vec3 t_Extinction = vec3(0.29, 0.086, 0.062);
         vec3 t_Transmittance = exp(-t_Extinction * (t_WaterDepth * 2.0));
 
-        vec3 t_DeepColor = vec3(0.004, 0.033, 0.084);
+        // What comes back out of deep water is skylight scattered by the column, so it belongs in
+        // the same units as everything else the sky lights. The fixed colour this replaces was a
+        // hundredth of what u_LightMapScale is worth, so deep water went to black wherever the
+        // bottom was too far down to show through. The tint is that old constant normalised;
+        // what it now multiplies is the sky's own brightness.
+        vec3 t_DeepColor = vec3(0.048, 0.393, 1.0) * u_LightMapScale.rgb * 0.055;
         vec3 t_WaterColor = t_Bottom * t_Transmittance + t_DeepColor * (1.0 - t_Transmittance);
 
         t_FinalColor = mix(t_WaterColor, t_SkyReflection, t_Fresnel);
@@ -835,7 +843,7 @@ class Device_Material {
         this.gfx_program = this.shader_instance.getGfxProgram(globals.renderCache);
 
         // Water draws in its own pass, once the rest of the scene is there to be seen through it.
-        this.is_water = material_type === Material_Type.Lake;
+        this.is_water = material_type === Material_Type.Lake || material_type === Material_Type.Pool;
         if (this.is_water) {
             this.texture_mapping_array.push(new TextureMapping(), new TextureMapping());
             this.texture_mapping_array[13].lateBinding = 'scene-color';

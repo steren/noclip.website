@@ -220,8 +220,12 @@ export class Post_Process {
         const max_exposure = 8.0;
         const vignetting = tone_mapping !== undefined ? tone_mapping.vignetting as number : 0.8;
         const bloom_enabled = bloom !== undefined ? bloom.enable_bloom !== false : true;
-        const bloom_threshold = bloom !== undefined ? bloom.bloom_threshold as number : 10.0;
-        const bloom_weight = bloom !== undefined ? bloom.bloom_weight as number : 0.75;
+        // This build ships no render/bloom section, so these are the whole of it. The threshold
+        // is measured after exposure, and exposure climbs in a dim scene, so a bright opening
+        // seen from inside a cave lands far past it -- keeping the weight low is what stops one
+        // blown-out doorway smearing across the frame.
+        const bloom_threshold = bloom !== undefined ? bloom.bloom_threshold as number : 14.0;
+        const bloom_weight = bloom !== undefined ? bloom.bloom_weight as number : 0.25;
 
         const fullscreen = (): GfxRenderInst => {
             const renderInst = renderInstManager.newRenderInst();
