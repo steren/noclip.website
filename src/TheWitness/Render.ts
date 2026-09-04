@@ -458,6 +458,57 @@ vec3 CalcSkyColor(in vec3 t_Direction) {
     return t_Color * u_SkyBrightness;
 }
 
+vec3 CalcWorldFromScreen(in vec2 t_ScreenUV, in float t_Depth) {
+    vec4 t_PosClip = vec4(t_ScreenUV.xy * 2.0 - 1.0, t_Depth, 1.0);
+#if !GFX_CLIPSPACE_NEAR_ZERO()
+    t_PosClip.z = t_PosClip.z * 2.0 - 1.0;
+#endif
+    vec4 t_PosWorld = UnpackMatrix(u_WorldFromClip) * t_PosClip;
+    return t_PosWorld.xyz / t_PosWorld.www;
+}
+
+// The island's lakes are mirrors, and what they mirror is standing right above them and already
+// drawn: the water pass runs after the rest of the scene and has its colour and depth to hand.
+// So the reflection is traced against those rather than by drawing the world a second time from
+// under the surface. The march is in world space, projecting each step, which keeps the test
+// below in metres instead of in the depth buffer's own crooked units. The water is not in that
+// depth buffer yet, so the ray cannot trip over the surface it started from.
+vec3 CalcScreenReflection(in vec3 t_Origin, in vec3 t_Direction, out float t_Confidence) {
+    t_Confidence = 0.0;
+
+    float t_Step = 0.4;
+    vec3 t_Position = t_Origin;
+
+    for (int i = 0; i < 20; i++) {
+        t_Position += t_Direction * t_Step;
+        t_Step *= 1.35;
+
+        vec4 t_Clip = UnpackMatrix(u_ViewProjection) * vec4(t_Position, 1.0);
+        if (t_Clip.w <= 0.0)
+            return vec3(0.0);
+
+        vec2 t_UV = (t_Clip.xy / t_Clip.w) * 0.5 + 0.5;
+        if (t_UV.x < 0.0 || t_UV.x > 1.0 || t_UV.y < 0.0 || t_UV.y > 1.0)
+            return vec3(0.0);
+
+        vec3 t_ScenePosition = CalcWorldFromScreen(t_UV, texture(SAMPLER_2D(u_SceneDepth), t_UV).r);
+
+        // Behind what was drawn there is a hit -- but only just behind it. Further back than the
+        // step that carried us there and the ray has passed clean through something thin and
+        // come out in front of scenery that has nothing to do with it.
+        float t_Behind = distance(t_Position, u_CameraPosWorld.xyz) - distance(t_ScenePosition, u_CameraPosWorld.xyz);
+        if (t_Behind > 0.0 && t_Behind < t_Step * 4.0) {
+            // Nothing traced across the screen can know what lies outside it, so let the answer
+            // fade out towards the borders rather than stop at one.
+            vec2 t_Fade = smoothstep(vec2(0.0), vec2(0.12), t_UV) * smoothstep(vec2(0.0), vec2(0.12), 1.0 - t_UV);
+            t_Confidence = t_Fade.x * t_Fade.y;
+            return texture(SAMPLER_2D(u_SceneColor), t_UV).rgb;
+        }
+    }
+
+    return vec3(0.0);
+}
+
 vec4 CalcAlbedo() {
     bool use_sky = ${this.is_type(m, Material_Type.Sky)};
     if (use_sky) {
@@ -615,29 +666,32 @@ void mainPS() {
 
         // Turn that depth back into a world position, so the distance down through the water is
         // just the drop from this surface to whatever lies under it.
-        vec4 t_PosClip = vec4(t_ScreenUV.xy * 2.0 - 1.0, t_SceneDepthSample, 1.0);
-#if !GFX_CLIPSPACE_NEAR_ZERO()
-        t_PosClip.z = t_PosClip.z * 2.0 - 1.0;
-#endif
-        vec4 t_PosWorld = UnpackMatrix(u_WorldFromClip) * t_PosClip;
-        vec3 t_BottomWorld = t_PosWorld.xyz / t_PosWorld.www;
+        vec3 t_BottomWorld = CalcWorldFromScreen(t_ScreenUV, t_SceneDepthSample);
         float t_WaterDepth = max(v_PositionWorld.z - t_BottomWorld.z, 0.0);
 
-        // Ripples: two slow wave trains crossing each other, tilting the surface a little. The
-        // amplitude is small on purpose -- the island's water is nearly a mirror.
-        vec2 t_WavePos = v_PositionWorld.xy;
-        float t_Wave0 = sin(dot(t_WavePos, vec2(0.21, 0.13)) + u_SceneTime * 0.8);
-        float t_Wave1 = sin(dot(t_WavePos, vec2(-0.09, 0.25)) + u_SceneTime * 0.55);
-        vec3 t_WaterNormal = normalize(vec3(0.02 * (t_Wave0 + 0.5 * t_Wave1), 0.02 * (t_Wave1 - 0.5 * t_Wave0), 1.0));
+        // The island's water is still. Not nearly still -- still: the lakes are mirrors, and the
+        // reflection puzzles are only readable because nothing disturbs them.
+        vec3 t_WaterNormal = vec3(0.0, 0.0, 1.0);
 
         // Grazing angles mirror the sky, straight down looks into the water: the Fresnel term
         // between the two is what gives the horizon its pale band and the foreground its blue.
         vec3 t_Reflected = reflect(-t_WorldDirectionToEye, t_WaterNormal);
-        t_Reflected.z = abs(t_Reflected.z);
-        vec3 t_SkyReflection = CalcSkyColor(t_Reflected);
+        vec3 t_SkyDirection = t_Reflected;
+        t_SkyDirection.z = abs(t_SkyDirection.z);
+        vec3 t_SkyReflection = CalcSkyColor(t_SkyDirection);
 
         float t_ViewDot = saturate(dot(t_WaterNormal, t_WorldDirectionToEye));
         float t_Fresnel = 0.02 + 0.98 * pow(1.0 - t_ViewDot, 5.0);
+
+        // The world's own reflection where the screen still holds it, the sky wherever it does
+        // not. Looking straight down the water barely reflects at all, and the march is much the
+        // most expensive thing here, so it is only worth walking when the answer will be seen.
+        vec3 t_Reflection = t_SkyReflection;
+        if (t_Fresnel > 0.06) {
+            float t_ReflectionConfidence;
+            vec3 t_TracedReflection = CalcScreenReflection(v_PositionWorld.xyz, t_Reflected, t_ReflectionConfidence);
+            t_Reflection = mix(t_SkyReflection, t_TracedReflection, t_ReflectionConfidence);
+        }
 
         // Looking into the water: the bottom, dimmed by however much water stands over it. A
         // metre of it barely tints the sand; ten metres of it is just blue. Light travelling
@@ -654,10 +708,10 @@ void mainPS() {
         vec3 t_DeepColor = vec3(0.048, 0.393, 1.0) * u_LightMapScale.rgb * 0.055;
         vec3 t_WaterColor = t_Bottom * t_Transmittance + t_DeepColor * (1.0 - t_Transmittance);
 
-        t_FinalColor = mix(t_WaterColor, t_SkyReflection, t_Fresnel);
+        t_FinalColor = mix(t_WaterColor, t_Reflection, t_Fresnel);
 
         // The sun's glint, tight enough to read as a highlight rather than a second sun.
-        float t_SunDot = saturate(dot(t_Reflected, u_KeyLightDir.xyz));
+        float t_SunDot = saturate(dot(t_SkyDirection, u_KeyLightDir.xyz));
         t_FinalColor += u_FogSunColor.rgb * pow(t_SunDot, 350.0) * 6.0;
     }
 
